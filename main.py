@@ -44,11 +44,10 @@ START_TIMEOUT_MIN = 5
 MAX_ATTEMPTS = 5
 MIN_STARTED_BYTES = 100 * 1024  # 100 KB = consider "started"
 
-# Backend: staging chunk API + webhooks (download-done, upload-done, failed)
+# Backend: staging upload API (POST /api/staging/upload) + webhooks (download-done, upload-done, failed)
 BACKEND_URL = os.environ.get("BACKEND_URL", "").rstrip("/")
 STAGING_SERVICE_TOKEN = os.environ.get("STAGING_SERVICE_TOKEN", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-CHUNK_SIZE_UPLOAD = 20 * 1024 * 1024  # 20 MB per chunk (matches frontend)
 
 # Prefer higher resolution (1080 > 720 > 480)
 RESOLUTION_ORDER = ["1080", "2160", "720", "480"]
@@ -301,6 +300,17 @@ def _clear_after_upload(file_path: str, download_root: str) -> None:
         _log(f"Clear failed: {e}")
 
 
+def _mimetype_for_path(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".mp4":
+        return "video/mp4"
+    if ext == ".webm":
+        return "video/webm"
+    if ext in (".mkv", ".mka"):
+        return "video/x-matroska"
+    return "video/mp4"
+
+
 def upload_file_to_staging(
     file_path: str,
     base_url: str,
@@ -311,64 +321,48 @@ def upload_file_to_staging(
     poster_path: str | None = None,
     job_id: str | None = None,
 ) -> tuple[bool, str | None]:
-    """POST file to backend /api/staging/upload-chunk in chunks. Reports progress via webhook if job_id set. Returns (success, stagingId or None)."""
+    """POST whole file to backend POST /api/staging/upload (single multipart). Same LAN as backend avoids chunk timeouts.
+    Reports progress via webhook if job_id set. Returns (success, stagingId or None)."""
     if not base_url or not token:
         return False, None
-    url = f"{base_url}/api/staging/upload-chunk"
+    url = f"{base_url}/api/staging/upload"
     headers = {"Authorization": f"Bearer {token}"}
     filename = os.path.basename(file_path)
-    size = os.path.getsize(file_path)
-    total_chunks = max(1, (size + CHUNK_SIZE_UPLOAD - 1) // CHUNK_SIZE_UPLOAD)
-    upload_id = uuid.uuid4().hex
+    mimetype = _mimetype_for_path(file_path)
+    data: dict[str, str] = {}
+    if title:
+        data["title"] = title
+    if tmdb_id is not None:
+        data["tmdbId"] = str(tmdb_id)
+    if poster_path:
+        data["poster_path"] = poster_path
+
     staging_id: str | None = None
-
-    def report_progress(chunk_index: int, progress: int | None = None) -> None:
-        if job_id:
-            payload = {"chunkIndex": chunk_index + 1, "totalChunks": total_chunks}
-            if progress is not None:
-                payload["progress"] = progress
-            _call_webhook(job_id, "upload-progress", **payload)
-
-    with open(file_path, "rb") as f:
-        for chunk_index in range(total_chunks):
-            chunk = f.read(CHUNK_SIZE_UPLOAD)
-            data = {
-                "uploadId": upload_id,
-                "chunkIndex": str(chunk_index),
-                "totalChunks": str(total_chunks),
-            }
-            if chunk_index == 0:
-                if title:
-                    data["title"] = title
-                if tmdb_id is not None:
-                    data["tmdbId"] = str(tmdb_id)
-                if poster_path:
-                    data["poster_path"] = poster_path
-            files = {"file": (filename, chunk, "application/octet-stream")}
-            is_last = chunk_index == total_chunks - 1
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (filename, f, mimetype)}
+            # Long timeout for large files on same LAN (e.g. 15 min)
+            r = requests.post(url, headers=headers, data=data, files=files, timeout=900, stream=True)
+        if r.status_code >= 400:
+            _log(f"Upload failed: {r.status_code} {r.text[:300]}")
+            return False, None
+        for line in r.iter_lines(decode_unicode=True):
+            if not line:
+                continue
             try:
-                r = requests.post(url, headers=headers, data=data, files=files, timeout=300, stream=is_last)
-            except requests.RequestException as e:
-                _log(f"Upload chunk error: {e}")
-                return False, None
-            if r.status_code >= 400:
-                _log(f"Upload chunk {chunk_index} failed: {r.status_code} {r.text[:200]}")
-                return False, None
-            report_progress(chunk_index)
-            if is_last:
-                for line in r.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        if obj.get("stage") == "writing" and obj.get("progress") is not None:
-                            report_progress(chunk_index, progress=obj["progress"])
-                        if obj.get("stage") == "done" and obj.get("stagingId"):
-                            staging_id = str(obj["stagingId"])
-                    except Exception:
-                        pass
-            if chunk_index % 10 == 0 or is_last:
-                _log(f"Upload chunk {chunk_index + 1}/{total_chunks}")
+                obj = json.loads(line)
+                if obj.get("stage") == "writing" and obj.get("progress") is not None and job_id:
+                    _call_webhook(job_id, "upload-progress", progress=int(obj["progress"]))
+                if obj.get("stage") == "done" and obj.get("stagingId"):
+                    staging_id = str(obj["stagingId"])
+                if obj.get("stage") == "error":
+                    _log(f"Upload error: {obj.get('message', '')}")
+                    return False, None
+            except Exception:
+                pass
+    except requests.RequestException as e:
+        _log(f"Upload error: {e}")
+        return False, None
     _log("Upload to staging done.")
     return True, staging_id
 
