@@ -242,8 +242,8 @@ if PREFERRED_QUALITY not in ("low", "med", "high"):
     PREFERRED_QUALITY = "low"
 
 # Direct path to ffmpeg binary, or leave empty to use PATH. Example: r"C:\ffmpeg\bin\ffmpeg.exe"
-FFMPEG_PATH = r"C:\Users\adria\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
-
+#FFMPEG_PATH = r"C:\Users\adria\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
+FFMPEG_PATH = "/usr/bin/ffmpeg"
 
 def _parse_master_m3u8(text: str) -> list[dict]:
     """Parse master m3u8; return list of {bandwidth, resolution, height, path, tier}."""
