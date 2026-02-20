@@ -3,6 +3,7 @@ Sniffer: bot-resistant GET agent and helpers for fetching embed/stream pages.
 Uses browser-like headers and a persistent session to reduce bot detection.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -140,6 +141,82 @@ def get_prorcp(
     prorcp_url = build_prorcp_url(prorcp_token, base)
     referer = build_rcp_referer(rcp_token, base)
     return get(prorcp_url, referer=referer, session=session, timeout=timeout, **kwargs)
+
+
+# Patterns to extract prorcp token from rcp page HTML (shared by normal GET and browser fallback)
+_PRORCP_PATTERNS = (
+    r"src:\s*['\"]\/prorcp\/([^'\"]+)['\"]",
+    r"src\s*:\s*['\"]\/prorcp\/([^'\"]+)['\"]",
+    r"['\"]\/prorcp\/([^'\"]+)['\"]",
+    r"\/prorcp\/([^\s'\"<>]{20,})",
+)
+
+
+def _extract_prorcp_token(html: str) -> str | None:
+    """Try all patterns; return first non-empty match or None."""
+    for pattern in _PRORCP_PATTERNS:
+        m = re.search(pattern, html)
+        if m:
+            token = m.group(1).strip()
+            if token:
+                return token
+    return None
+
+
+def _fetch_rcp_page_with_browser(rcp_url: str, log_fn=None) -> tuple[str | None, list]:
+    """
+    Load the rcp page in a real browser (Puppeteer) so Cloudflare Turnstile can run.
+    Uses downloader/fetch_rcp_browser.js (Node + Puppeteer, headed). Returns (html_content, cookie_list).
+    On failure returns (None, []). Run: cd downloader && npm install && node fetch_rcp_browser.js <url>
+    """
+    log = log_fn if callable(log_fn) else (lambda _: None)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(script_dir, "fetch_rcp_browser.js")
+    if not os.path.isfile(script_path):
+        log("      fetch_rcp_browser.js not found. Expect it in downloader/.")
+        return (None, [])
+
+    set_state(explanation="[3/8] Solving Cloudflare Turnstile (real browser)…")
+    log("      Launching real browser (Puppeteer) to scrape rcp page…")
+    try:
+        proc = subprocess.run(
+            ["node", script_path, rcp_url],
+            cwd=script_dir,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except FileNotFoundError:
+        log("      Node.js not found. Install Node and run: cd downloader && npm install")
+        return (None, [])
+    except subprocess.TimeoutExpired:
+        log("      Browser script timed out (90s).")
+        return (None, [])
+
+    out = (proc.stdout or "").strip()
+    if not out:
+        err = (proc.stderr or "").strip() or "no output"
+        log("      Browser script failed: %s" % err)
+        return (None, [])
+
+    try:
+        data = json.loads(out)
+    except Exception as e:
+        log("      Invalid JSON from browser script: %s" % e)
+        return (None, [])
+
+    if data.get("error"):
+        log("      Browser: %s" % data["error"])
+        return (None, [])
+
+    html = data.get("html") or ""
+    cookies = data.get("cookies") or []
+    if not html or not _extract_prorcp_token(html):
+        log("      Browser returned content but no prorcp token.")
+        return (None, [])
+
+    log("      Browser: got content and %s cookie(s)." % len(cookies))
+    return (html, cookies)
 
 
 # Example: from play.html you have iframe src="/prorcp/TOKEN1" and parent page is /rcp/TOKEN2
@@ -401,40 +478,44 @@ def run_sniffer(
         return _finish(result)
     rcp_token = parsed.path.split("/rcp/", 1)[1]
     _log("      rcp_token: " + (rcp_token[:40] + "..." if len(rcp_token) > 40 else rcp_token))
+
+    rcp_html = None
+    rcp_cookies = []  # list of {name, value, domain, path} from browser (if used)
     try:
         rcp_resp = get(src)
         rcp_resp.raise_for_status()
+        rcp_html = rcp_resp.text
+        _log("      OK %s" % rcp_resp.status_code)
     except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
-        return _finish(result)
-    _log("      OK %s" % rcp_resp.status_code)
+        _log("      GET rcp failed: %s" % e)
 
+    # If normal GET didn't return content with prorcp token, try browser (Cloudflare Turnstile)
+    prorcp_token = _extract_prorcp_token(rcp_html) if rcp_html else None
+    if not prorcp_token:
+        set_state(explanation="[3/8] Rcp page behind Turnstile, using browser…")
+        rcp_html, rcp_cookies = _fetch_rcp_page_with_browser(src, log_fn=_log)
+        prorcp_token = _extract_prorcp_token(rcp_html) if rcp_html else None
 
     set_state(explanation="[4/8] Finding /prorcp/ token in JS (loadIframe)")
-    # Bullet-proof: try multiple patterns so we don't miss token (single/double quotes, different formatting)
-    prorcp_token = None
-    for pattern in (
-        r"src:\s*['\"]\/prorcp\/([^'\"]+)['\"]",   # src: '/prorcp/TOKEN' or src: "/prorcp/TOKEN"
-        r"src\s*:\s*['\"]\/prorcp\/([^'\"]+)['\"]", # relaxed spaces
-        r"['\"]\/prorcp\/([^'\"]+)['\"]",          # any '/prorcp/TOKEN' or "/prorcp/TOKEN"
-        r"\/prorcp\/([^\s'\"<>]{20,})",            # path-only, any non-trivial token
-    ):
-        m = re.search(pattern, rcp_resp.text)
-        if m:
-            prorcp_token = m.group(1).strip()
-            if prorcp_token:
-                break
     if not prorcp_token:
         result["status"] = "error"
-        result["error"] = "no prorcp token"
+        result["error"] = "no prorcp token (Turnstile or missing in page)"
         _log("      No /prorcp/ token found in rcp page.")
         return _finish(result)
     _log("      prorcp_token: " + (prorcp_token[:40] + "..." if len(prorcp_token) > 40 else prorcp_token))
 
     set_state(explanation="[5/8] GET prorcp player page (with Referer)")
+    session_with_cookies = None
+    if rcp_cookies:
+        session_with_cookies = create_agent()
+        for c in rcp_cookies:
+            session_with_cookies.cookies.set(
+                c["name"], c["value"],
+                domain=c.get("domain") or parsed.hostname or "",
+                path=c.get("path") or "/",
+            )
     try:
-        prorcp_resp = get_prorcp(prorcp_token, rcp_token)
+        prorcp_resp = get_prorcp(prorcp_token, rcp_token, session=session_with_cookies)
         prorcp_resp.raise_for_status()
     except Exception as e:
         result["status"] = "error"

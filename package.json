@@ -1,0 +1,12 @@
+{
+  "name": "streamhaven-downloader-browser",
+  "version": "1.0.0",
+  "description": "Puppeteer script for sniffer: fetch rcp page in real browser (Turnstile)",
+  "private": true,
+  "scripts": {
+    "fetch-rcp": "node fetch_rcp_browser.js"
+  },
+  "dependencies": {
+    "puppeteer": "^23.0.0"
+  }
+}
