@@ -63,42 +63,21 @@ STALL_TIMEOUT_MIN = int(os.environ.get("STALL_TIMEOUT_MIN", "15"))
 STALL_CHECK_INTERVAL_SEC = int(os.environ.get("STALL_CHECK_INTERVAL_SEC", "60"))
 # Disk: fail before download/upload if free space below this (GB); 0 = disabled
 MIN_FREE_DISK_GB = float(os.environ.get("MIN_FREE_DISK_GB", "10"))
+# After job ends (done/failed), wait this many seconds then revert progress to idle so backend can see "idle"
+IDLE_REVERT_DELAY_SEC = int(os.environ.get("IDLE_REVERT_DELAY_SEC", "60"))
 
 # -----------------------------------------------------------------------------
-# Progress state (download + upload) — backend can GET /progress to see where we are
+# Process state (imported) — backend can GET /progress to see where we are
 # -----------------------------------------------------------------------------
 
-_progress_lock = Lock()
-_progress: dict = {"phase": "idle", "download": {}, "upload": {}, "updatedAt": None}
+try:
+    from process_state import get_state, set_state, clear_state, schedule_revert_to_idle
+except ImportError:
+    from downloader.process_state import get_state, set_state, clear_state, schedule_revert_to_idle
 
-def _progress_state() -> dict:
-    """Current progress (thread-safe read)."""
-    with _progress_lock:
-        return {
-            "jobId": _progress.get("jobId"),
-            "phase": _progress.get("phase", "idle"),  # idle|searching|downloading|uploading|done|failed
-            "download": dict(_progress.get("download") or {}),
-            "upload": dict(_progress.get("upload") or {}),
-            "updatedAt": _progress.get("updatedAt"),
-        }
 
-def _set_progress(**kwargs: object) -> None:
-    with _progress_lock:
-        _progress["updatedAt"] = time.time()
-        for k, v in kwargs.items():
-            if v is not None:
-                if k == "download" and isinstance(v, dict):
-                    _progress.setdefault("download", {}).update(v)
-                elif k == "upload" and isinstance(v, dict):
-                    _progress.setdefault("upload", {}).update(v)
-                else:
-                    _progress[k] = v
-
-def _clear_progress() -> None:
-    with _progress_lock:
-        _progress.clear()
-        _progress["phase"] = "idle"
-        _progress["updatedAt"] = time.time()
+def _schedule_revert_to_idle() -> None:
+    schedule_revert_to_idle(delay_sec=IDLE_REVERT_DELAY_SEC, log_fn=_log)
 
 def _log(msg: str) -> None:
     print(f"[download] {msg}", flush=True)
@@ -348,8 +327,8 @@ def _create_app():
     @app.route("/progress", methods=["GET"])
     def progress():
         """Return current download + upload progress so backend can poll (e.g. to see if failure is downloader→backend or backend→db)."""
-        print(_progress_state())
-        return jsonify(_progress_state())
+        print(get_state())
+        return jsonify(get_state())
 
     @app.route("/download", methods=["POST"])
     def download():
@@ -456,12 +435,12 @@ def _run_aria2_download(
         # Stream countdown: seconds until considered stalled (so frontend can show "Stall in Xs")
         elapsed = time.monotonic() - last_progress_time
         stall_seconds_remaining = max(0, int(stall_timeout_sec - elapsed))
-        _set_progress(download={"stall_seconds_remaining": stall_seconds_remaining})
+        set_state(download={"stall_seconds_remaining": stall_seconds_remaining})
         if elapsed >= stall_timeout_sec:
             stall_min = STALL_TIMEOUT_MIN
             msg = f"Download stalled (no progress for {stall_min} min), terminating."
             _log(msg)
-            _set_progress(download={"error": f"Download stalled (no progress for {stall_min} min)"})
+            set_state(download={"error": f"Download stalled (no progress for {stall_min} min)"})
             proc.terminate()
             try:
                 proc.wait(timeout=10)
@@ -586,7 +565,7 @@ class _CountingFileReader:
         self._read += len(data)
         if self._on_progress and self._total:
             pct = min(100, round(100 * self._read / self._total))
-            _set_progress(upload={"bytes_sent": self._read, "bytes_total": self._total, "percent": pct})
+            set_state(upload={"bytes_sent": self._read, "bytes_total": self._total, "percent": pct})
         return data
 
     def __iter__(self):
@@ -610,7 +589,7 @@ class _CountingFileReader:
 
 def _notify_upload_failed(job_id: str | None, err_msg: str) -> None:
     """So backend never stays stuck in 'uploading' (connection cut, HTTP error, etc.)."""
-    _set_progress(upload={"phase": "error", "error": err_msg})
+    set_state(upload={"phase": "error", "error": err_msg})
     if job_id:
         _call_webhook(job_id, "failed", errorMessage=err_msg)
 
@@ -694,7 +673,7 @@ def upload_file_to_staging(
             _notify_upload_failed(job_id, err_msg)
             return False, None
         return True, staging_id
-    _set_progress(upload={"bytes_sent": file_size, "bytes_total": file_size, "phase": "done", "percent": 100})
+    set_state(upload={"bytes_sent": file_size, "bytes_total": file_size, "phase": "done", "percent": 100})
     _log("Upload to staging done.")
     return True, staging_id
 
@@ -731,12 +710,14 @@ def run_download(
 ) -> None:
     def fail(msg: str) -> None:
         _log(f"phase=failed error={msg}")
-        _set_progress(phase="failed", download={"error": msg})
+        set_state(phase="failed", download={"error": msg})
         if job_id:
             _call_webhook(job_id, "failed", errorMessage=msg)
+        _schedule_revert_to_idle()
 
     try:
-        _set_progress(jobId=job_id, phase="searching", download={}, upload={})
+        clear_state()
+        set_state(jobId=job_id, phase="searching", download={}, upload={})
         _log("phase=searching")
         try:
             results = tpb.search(title)
@@ -761,7 +742,7 @@ def run_download(
             torrent_name = (chosen.name or "").strip() or "—"
             s = f" ({seeders} seeders)" if seeders is not None else ""
             _log(f"phase=downloading attempt={attempt} torrent_name={torrent_name}{s}")
-            _set_progress(
+            set_state(
                 phase="downloading",
                 download={
                     "bytes_done": 0,
@@ -782,7 +763,7 @@ def run_download(
                 except Exception as e:
                     _log(f"Download thread error: {e}")
                     _log(traceback.format_exc())
-                    _set_progress(download={"error": str(e)})
+                    set_state(download={"error": str(e)})
                     download_result.append(False)
                 finally:
                     download_done.append(True)
@@ -793,7 +774,7 @@ def run_download(
                 bytes_done = _dir_size(DOWNLOAD_DIR)
                 # Total from .torrent (aria2 saves metadata); None until metadata is there
                 bytes_total = _torrent_total_from_dir(DOWNLOAD_DIR)
-                _set_progress(
+                set_state(
                     download={
                         "bytes_done": bytes_done,
                         "bytes_total": bytes_total,
@@ -806,13 +787,12 @@ def run_download(
             ok = download_result[0] if download_result else False
             if ok:
                 bytes_total = _dir_size(DOWNLOAD_DIR)
-                _set_progress(download={"bytes_done": bytes_total, "bytes_total": bytes_total})
+                set_state(download={"bytes_done": bytes_total, "bytes_total": bytes_total})
             else:
                 # Preserve error set by download (e.g. stall); only set default if none
-                with _progress_lock:
-                    existing = (_progress.get("download") or {}).get("error")
+                existing = (get_state().get("download") or {}).get("error")
                 if not existing:
-                    _set_progress(download={"error": "No start in timeout"})
+                    set_state(download={"error": "No start in timeout"})
 
             _log(f"Downloaded: {ok}")
             if ok:
@@ -827,7 +807,7 @@ def run_download(
                     _call_webhook(job_id, "download-done")
 
                 if BACKEND_URL and STAGING_SERVICE_TOKEN:
-                    _set_progress(phase="uploading", upload={"bytes_sent": 0, "bytes_total": os.path.getsize(video_path), "percent": 0, "phase": "uploading", "error": None})
+                    set_state(phase="uploading", upload={"bytes_sent": 0, "bytes_total": os.path.getsize(video_path), "percent": 0, "phase": "uploading", "error": None})
                     _log("phase=uploading")
                     upload_title = (chosen.name or "").strip() or title
                     ok_upload, staging_id = upload_file_to_staging(
@@ -840,20 +820,22 @@ def run_download(
                         job_id=job_id,
                     )
                     if ok_upload:
-                        _set_progress(phase="done", upload={"phase": "done", "percent": 100})
+                        set_state(phase="done", upload={"phase": "done", "percent": 100})
                         _log("phase=done")
                         if job_id:
                             _call_webhook(job_id, "upload-done", stagingId=staging_id)
                         _clear_after_upload(video_path, DOWNLOAD_DIR)
+                        _schedule_revert_to_idle()
                     else:
-                        _set_progress(phase="failed", upload={"phase": "error", "error": "Staging upload failed"})
+                        set_state(phase="failed", upload={"phase": "error", "error": "Staging upload failed"})
                         fail("Staging upload failed.")
                     return
                 else:
-                    _set_progress(phase="done")
+                    set_state(phase="done")
                     _log("phase=done (no staging configured)")
                     if job_id:
                         _call_webhook(job_id, "upload-done")
+                    _schedule_revert_to_idle()
                     return
             _log(f"No start in {START_TIMEOUT_MIN} min, trying next.")
         fail(f"Failed after {MAX_ATTEMPTS} attempts.")
@@ -862,7 +844,7 @@ def run_download(
         _log(traceback.format_exc())
         fail(f"Error: {e}")
     finally:
-        # Keep state for a bit so backend can read "done" or "failed"; caller can clear later
+        # Revert to idle is scheduled from done/fail paths after IDLE_REVERT_DELAY_SEC
         pass
 
 

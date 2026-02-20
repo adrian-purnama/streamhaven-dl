@@ -106,9 +106,30 @@ def _sanitize_filename(name: str) -> str:
     return name.strip() or "download"
 
 
+class _ProgressFileWrapper:
+    """File-like wrapper that reports upload progress to process_state (bytes_sent, bytes_total, percent)."""
+    def __init__(self, file_obj, total_bytes: int, on_progress):
+        self._file = file_obj
+        self._total = total_bytes
+        self._sent = 0
+        self._on_progress = on_progress
+        self._last_percent = -1
+
+    def read(self, size: int = -1):
+        data = self._file.read(size)
+        self._sent += len(data)
+        if self._total and self._on_progress:
+            percent = round(100 * self._sent / self._total)
+            if percent != self._last_percent:
+                self._last_percent = percent
+                self._on_progress(self._sent, self._total)
+        return data
+
+
 def upload_to_staging(file_path: str, filename: str, doc: dict) -> tuple[ObjectId | None, str | None]:
     """
     Upload mp4 to GridFS (stagingVideos.files, stagingVideos.chunks) and create StagingVideo doc.
+    Reports upload progress via set_state(upload={bytes_sent, bytes_total, percent}) for UI progress bar.
     Returns (staging_id, None) on success or (None, error_message) on failure.
     """
     db = get_db()
@@ -119,8 +140,14 @@ def upload_to_staging(file_path: str, filename: str, doc: dict) -> tuple[ObjectI
     try:
         bucket = GridFSBucket(db, bucket_name=GRIDFS_BUCKET)
         size = os.path.getsize(file_path)
+        set_state(upload={"bytes_sent": 0, "bytes_total": size, "percent": 0})
+
+        def on_progress(sent: int, total: int) -> None:
+            set_state(upload={"bytes_sent": sent, "bytes_total": total, "percent": round(100 * sent / total) if total else 0})
+
         with open(file_path, "rb") as f:
-            file_id = bucket.upload_from_stream(filename, f, metadata={"contentType": "video/mp4"})
+            wrapper = _ProgressFileWrapper(f, size, on_progress)
+            file_id = bucket.upload_from_stream(filename, wrapper, metadata={"contentType": "video/mp4"})
         staging_coll = db[STAGING_VIDEO_COLLECTION]
         staging_doc = {
             "gridFsFileId": file_id,
@@ -193,7 +220,7 @@ def _process_one_job(doc) -> dict:
         return {"success": False, "message": "Missing tmdbId or url", "url": None}
 
     # Step 1: get m3u8 link (no ffmpeg)
-    result = run_sniffer(url, download=False, log=True, preferred_quality=quality)
+    result = run_sniffer(url, log=True, preferred_quality=quality)
     m3u8_link = result.get("m3u8_link")
     if not result.get("success") or not m3u8_link:
         set_state(phase="idle", snifferResult=result)
@@ -209,7 +236,7 @@ def _process_one_job(doc) -> dict:
     title = doc.get("title") or "download"
     safe_name = _sanitize_filename(str(title)) + ".mp4"
     output_mp4 = os.path.join(DOWNLOADS_DIR, safe_name)
-    set_state(phase="downloading", download={"byte_done": 0, "byte_total": None})
+    set_state(phase="downloading", explanation="[9/9] Downloading with ffmpeg -> " + output_mp4)
     if coll is not None:
         coll.update_one({"_id": doc_id}, {"$set": {"status": "downloading", "errorMessage": None}})
     ok = download_m3u8_with_ffmpeg(m3u8_link, output_mp4, timeout_sec=3600, log=True)
@@ -219,13 +246,20 @@ def _process_one_job(doc) -> dict:
         result["error"] = "ffmpeg download failed"
         if coll is not None:
             coll.update_one({"_id": doc_id}, {"$set": {"status": "failed", "errorMessage": "ffmpeg failed"}})
+        set_state(phase="failed", snifferResult=result, explanation="ffmpeg failed")
+        try:
+            if os.path.isfile(output_mp4):
+                os.remove(output_mp4)
+                print("[sniffer_server] deleted partial download on ffmpeg failure:", output_mp4)
+        except OSError as e:
+            print("[sniffer_server] failed to delete partial download:", e)
         set_state(phase="idle", snifferResult=result)
         return {"success": False, "message": "ffmpeg failed", "url": url}
 
     result["output_path"] = output_mp4
     if coll is not None:
         coll.update_one({"_id": doc_id}, {"$set": {"status": "uploading", "errorMessage": None}})
-    set_state(phase="uploading")
+    set_state(phase="uploading", explanation="[10/10] Uploading to staging")
     staging_id, upload_err = upload_to_staging(output_mp4, safe_name, doc)
     if staging_id is not None:
         result["success"] = True
@@ -233,13 +267,21 @@ def _process_one_job(doc) -> dict:
         result["error"] = None
         if coll is not None:
             coll.update_one({"_id": doc_id}, {"$set": {"status": "done", "stagingId": str(staging_id), "errorMessage": None}})
+        # delete everything in downloads dir after done
+        try:
+            for f in os.listdir(DOWNLOADS_DIR):
+                p = os.path.join(DOWNLOADS_DIR, f)
+                if os.path.isfile(p):
+                    os.remove(p)
+        except OSError as e:
+            print("[sniffer_server] cleanup downloads dir failed:", e)
     else:
         result["success"] = False
         result["status"] = "upload_failed"
         result["error"] = upload_err or "Upload to staging failed"
         if coll is not None:
             coll.update_one({"_id": doc_id}, {"$set": {"status": "failed", "errorMessage": upload_err or "Upload failed"}})
-    set_state(phase="idle", snifferResult=result)
+    set_state(phase="idle", snifferResult=result, explanation="Previous Sniffer pipeline completed")
     return {"success": result["success"], "message": "Done" if staging_id else (result["error"] or "Failed"), "stagingId": str(staging_id) if staging_id else None, "url": url}
 
 

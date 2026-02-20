@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import requests
@@ -234,6 +235,33 @@ def _pick_variant(variants: list[dict], preferred: str) -> dict | None:
     return max(in_tier, key=lambda v: v["bandwidth"])
 
 
+# Regex to find page number in segment URLs (e.g. .../page-1235.html)
+_PAGE_RE = re.compile(r"page-(\d+)\.html", re.I)
+
+
+def _get_total_pages_from_m3u8(m3u8_url: str) -> int | None:
+    """Fetch m3u8 (and follow variant if master), parse segment URLs for page-XXX.html; return largest page number or None."""
+    try:
+        r = get(m3u8_url, timeout=15)
+        r.raise_for_status()
+        text = r.text
+        # If master playlist, follow first variant
+        if "#EXT-X-STREAM-INF" in text:
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    base = m3u8_url.rsplit("/", 1)[0] + "/"
+                    variant_url = line if line.startswith("http") else (base + line.lstrip("/"))
+                    r2 = get(variant_url, timeout=15)
+                    if r2.ok:
+                        text = r2.text
+                    break
+        pages = [int(m.group(1)) for m in _PAGE_RE.finditer(text)]
+        return max(pages) if pages else None
+    except Exception:
+        return None
+
+
 def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int | None = None, log: bool = False) -> bool:
     """Run ffmpeg to download m3u8 to output_path. Returns True on success."""
     ffmpeg = None
@@ -260,48 +288,81 @@ def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int 
         output_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=timeout_sec)
-        stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
-        if result.returncode != 0:
-            print("      ffmpeg failed:", result.returncode, (stderr[-500:] if stderr else ""))
+        total_pages = _get_total_pages_from_m3u8(m3u8_url)
+        if total_pages is not None:
+            set_state(download={"total_pages": total_pages, "current_page": 0})
+
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, universal_newlines=True, errors="replace")
+        stderr_lines = []
+        opening_re = re.compile(r"Opening\s+'([^']+)'\s+for\s+reading", re.I)
+
+        def read_stderr():
+            for line in proc.stderr:
+                line = line.rstrip("\n\r")
+                if line:
+                    stderr_lines.append(line)
+                    if log:
+                        print("      [ffmpeg]", line, flush=True)
+                    set_state(explanation="[ffmpeg] " + line)
+                    # Extract current page from "Opening '...page-1232.html' for reading"
+                    mo = opening_re.search(line)
+                    if mo:
+                        url = mo.group(1)
+                        pm = _PAGE_RE.search(url)
+                        if pm:
+                            current = int(pm.group(1))
+                            d = {"current_page": current}
+                            if total_pages is not None:
+                                d["total_pages"] = total_pages
+                            set_state(download=d)
+
+        reader = threading.Thread(target=read_stderr, daemon=True)
+        reader.start()
+        start = time.time()
+        while proc.poll() is None:
+            if timeout_sec is not None and (time.time() - start) > timeout_sec:
+                proc.kill()
+                proc.wait()
+                print("      ffmpeg timeout", flush=True)
+                return False
+            time.sleep(0.2)
+        reader.join(timeout=2.0)
+        if proc.returncode != 0:
+            tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            print("      ffmpeg failed:", proc.returncode, tail[-500:] if tail else "", flush=True)
             return False
-        # Optionally print/log ffmpeg output
-        if stderr and log:
-            for line in stderr.strip().splitlines():
-                print("      [ffmpeg]", line)
         return True
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print("      ffmpeg failed:", e)
+    except FileNotFoundError as e:
+        print("      ffmpeg failed:", e, flush=True)
         return False
 
 
 def run_sniffer(
     url: str,
     *,
-    download: bool = True,
     preferred_quality: str | None = None,
     log: bool = True,
 ) -> dict:
     """
-    Run the full sniffer pipeline for a vidsrc embed URL. Returns a result dict.
-    Does not sys.exit; use result["success"] and result["status"] / result["error"].
+    Run the sniffer pipeline: get m3u8 link from vidsrc embed URL. Returns result dict.
+    Does not download; caller runs ffmpeg separately.
     """
     quality = (preferred_quality or PREFERRED_QUALITY).strip().lower()
     if quality not in ("low", "med", "high"):
         quality = "high"
     result = {"success": False, "status": "idle", "m3u8_link": None, "output_path": None, "error": None}
 
-    set_state(phase="searching")
+    set_state(phase="searching", explanation="Starting sniffer pipeline")
 
     def _finish(res: dict) -> dict:
-        set_state(phase="idle", snifferResult=res)
+        set_state(phase="idle", snifferResult=res, explanation="Sniffer pipeline completed")
         return res
 
     def _log(msg: str) -> None:
         if log:
             print(msg)
 
-    _log("[1/8] Fetching vidsrc embed page...")
+    set_state(explanation="[1/8] Fetching vidsrc embed page")
     try:
         vidsrc = get(url)
     except Exception as e:
@@ -319,7 +380,7 @@ def run_sniffer(
 
     _log("      OK %s | length: %s" % (vidsrc.status_code, len(vidsrc.text)))
     soup = parse_html(vidsrc.text)
-    _log("[2/8] Finding Cloudnestra /rcp/ iframe...")
+    set_state(explanation="[2/8] Finding Cloudnestra /rcp/ iframe")
     iframe = soup.find("iframe", id="player_iframe")
     if not (iframe and iframe.get("src")):
         result["status"] = "video_not_available"
@@ -331,7 +392,7 @@ def run_sniffer(
         src = "https:" + src
     _log("      Cloudnestra /rcp URL: " + (src[:70] + "..." if len(src) > 70 else src))
 
-    _log("[3/8] Extracting rcp token and fetching /rcp/ page (play.html)...")
+    set_state(explanation="[3/8] Extracting rcp token and fetching /rcp/ page (play.html)")
     parsed = urlparse(src)
     if "/rcp/" not in parsed.path:
         result["status"] = "error"
@@ -349,7 +410,8 @@ def run_sniffer(
         return _finish(result)
     _log("      OK %s" % rcp_resp.status_code)
 
-    _log("[4/8] Finding /prorcp/ token in JS (loadIframe)...")
+
+    set_state(explanation="[4/8] Finding /prorcp/ token in JS (loadIframe)")
     m = re.search(r"src:\s*'/prorcp/([^']+)'", rcp_resp.text)
     if not m:
         result["status"] = "error"
@@ -359,7 +421,7 @@ def run_sniffer(
     prorcp_token = m.group(1)
     _log("      prorcp_token: " + (prorcp_token[:40] + "..." if len(prorcp_token) > 40 else prorcp_token))
 
-    _log("[5/8] GET prorcp player page (with Referer)...")
+    set_state(explanation="[5/8] GET prorcp player page (with Referer)")
     try:
         prorcp_resp = get_prorcp(prorcp_token, rcp_token)
         prorcp_resp.raise_for_status()
@@ -369,7 +431,7 @@ def run_sniffer(
         return _finish(result)
     _log("      OK %s | length: %s" % (prorcp_resp.status_code, len(prorcp_resp.text)))
 
-    _log("[6/8] Extracting m3u8 path and test_doms from prorcp HTML...")
+    set_state(explanation="[6/8] Extracting m3u8 path and test_doms from prorcp HTML")
     m3u8_path = None
     m_path = re.search(r'https?://[^/]+(/pl/[^\s"\'<>]+\.m3u8)', prorcp_resp.text, re.I)
     if m_path:
@@ -402,7 +464,7 @@ def run_sniffer(
         _log("      Have domains but no m3u8 path; stopping.")
         return _finish(result)
 
-    _log("[7/8] Testing domains for availability (200)...")
+    set_state(explanation="[7/8] Testing domains for availability (200)")
     ready_domain = None
     for dom in dom_candidates:
         try:
@@ -420,7 +482,7 @@ def run_sniffer(
         _log("      No domain returned 200.")
         return _finish(result)
 
-    _log("[8/8] Fetching master m3u8, parsing variants (low/med/high), picking %s ..." % quality)
+    set_state(explanation="[8/8] Fetching master m3u8, parsing variants (low/med/high), picking %s" % quality)
     master_url = ready_domain + (m3u8_path if m3u8_path.startswith("/") else "/" + m3u8_path)
     _log("      master_url: " + (master_url[:80] + "..." if len(master_url) > 80 else master_url))
     try:
@@ -446,25 +508,8 @@ def run_sniffer(
         else:
             m3u8_link = master_url
     result["m3u8_link"] = m3u8_link
-
-    if not download:
-        result["success"] = True
-        result["status"] = "ok"
-        return _finish(result)
-
-    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-    output_mp4 = os.environ.get("M3U8_OUTPUT") or os.path.join(DOWNLOADS_DIR, "sniffer_download.mp4")
-    _log("[9/9] Downloading with ffmpeg -> " + output_mp4)
-    set_state(phase="downloading", download={"byte_done": 0, "byte_total": None})
-    if not download_m3u8_with_ffmpeg(m3u8_link, output_mp4, timeout_sec=3600):
-        result["status"] = "ffmpeg_failed"
-        result["error"] = "ffmpeg download failed"
-        _log("      ffmpeg download failed.")
-        return _finish(result)
-    _log("      Done. " + output_mp4)
     result["success"] = True
     result["status"] = "ok"
-    result["output_path"] = output_mp4
     return _finish(result)
 
 
