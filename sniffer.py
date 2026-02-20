@@ -165,8 +165,7 @@ if PREFERRED_QUALITY not in ("low", "med", "high"):
     PREFERRED_QUALITY = "low"
 
 # Direct path to ffmpeg binary, or leave empty to use PATH. Example: r"C:\ffmpeg\bin\ffmpeg.exe"
-FFMPEG_PATH = r"/usr/bin/ffmpeg"
-# FFMPEG_PATH = r"C:\Users\adria\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
+FFMPEG_PATH = r"C:\Users\adria\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
 
 
 def _parse_master_m3u8(text: str) -> list[dict]:
@@ -236,6 +235,33 @@ def _pick_variant(variants: list[dict], preferred: str) -> dict | None:
     return max(in_tier, key=lambda v: v["bandwidth"])
 
 
+# Regex to find page number in segment URLs (e.g. .../page-1235.html)
+_PAGE_RE = re.compile(r"page-(\d+)\.html", re.I)
+
+
+def _get_total_pages_from_m3u8(m3u8_url: str) -> int | None:
+    """Fetch m3u8 (and follow variant if master), parse segment URLs for page-XXX.html; return largest page number or None."""
+    try:
+        r = get(m3u8_url, timeout=15)
+        r.raise_for_status()
+        text = r.text
+        # If master playlist, follow first variant
+        if "#EXT-X-STREAM-INF" in text:
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    base = m3u8_url.rsplit("/", 1)[0] + "/"
+                    variant_url = line if line.startswith("http") else (base + line.lstrip("/"))
+                    r2 = get(variant_url, timeout=15)
+                    if r2.ok:
+                        text = r2.text
+                    break
+        pages = [int(m.group(1)) for m in _PAGE_RE.finditer(text)]
+        return max(pages) if pages else None
+    except Exception:
+        return None
+
+
 def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int | None = None, log: bool = False) -> bool:
     """Run ffmpeg to download m3u8 to output_path. Returns True on success."""
     ffmpeg = None
@@ -262,8 +288,13 @@ def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int 
         output_path,
     ]
     try:
+        total_pages = _get_total_pages_from_m3u8(m3u8_url)
+        if total_pages is not None:
+            set_state(download={"total_pages": total_pages, "current_page": 0})
+
         proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, universal_newlines=True, errors="replace")
         stderr_lines = []
+        opening_re = re.compile(r"Opening\s+'([^']+)'\s+for\s+reading", re.I)
 
         def read_stderr():
             for line in proc.stderr:
@@ -272,7 +303,18 @@ def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int 
                     stderr_lines.append(line)
                     if log:
                         print("      [ffmpeg]", line, flush=True)
-                        set_state(explanation="[ffmpeg] " + line)
+                    set_state(explanation="[ffmpeg] " + line)
+                    # Extract current page from "Opening '...page-1232.html' for reading"
+                    mo = opening_re.search(line)
+                    if mo:
+                        url = mo.group(1)
+                        pm = _PAGE_RE.search(url)
+                        if pm:
+                            current = int(pm.group(1))
+                            d = {"current_page": current}
+                            if total_pages is not None:
+                                d["total_pages"] = total_pages
+                            set_state(download=d)
 
         reader = threading.Thread(target=read_stderr, daemon=True)
         reader.start()
@@ -370,13 +412,24 @@ def run_sniffer(
 
 
     set_state(explanation="[4/8] Finding /prorcp/ token in JS (loadIframe)")
-    m = re.search(r"src:\s*'/prorcp/([^']+)'", rcp_resp.text)
-    if not m:
+    # Bullet-proof: try multiple patterns so we don't miss token (single/double quotes, different formatting)
+    prorcp_token = None
+    for pattern in (
+        r"src:\s*['\"]\/prorcp\/([^'\"]+)['\"]",   # src: '/prorcp/TOKEN' or src: "/prorcp/TOKEN"
+        r"src\s*:\s*['\"]\/prorcp\/([^'\"]+)['\"]", # relaxed spaces
+        r"['\"]\/prorcp\/([^'\"]+)['\"]",          # any '/prorcp/TOKEN' or "/prorcp/TOKEN"
+        r"\/prorcp\/([^\s'\"<>]{20,})",            # path-only, any non-trivial token
+    ):
+        m = re.search(pattern, rcp_resp.text)
+        if m:
+            prorcp_token = m.group(1).strip()
+            if prorcp_token:
+                break
+    if not prorcp_token:
         result["status"] = "error"
         result["error"] = "no prorcp token"
         _log("      No /prorcp/ token found in rcp page.")
         return _finish(result)
-    prorcp_token = m.group(1)
     _log("      prorcp_token: " + (prorcp_token[:40] + "..." if len(prorcp_token) > 40 else prorcp_token))
 
     set_state(explanation="[5/8] GET prorcp player page (with Referer)")

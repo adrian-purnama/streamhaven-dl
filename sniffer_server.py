@@ -130,6 +130,7 @@ def upload_to_staging(file_path: str, filename: str, doc: dict) -> tuple[ObjectI
     """
     Upload mp4 to GridFS (stagingVideos.files, stagingVideos.chunks) and create StagingVideo doc.
     Reports upload progress via set_state(upload={bytes_sent, bytes_total, percent}) for UI progress bar.
+    Only updates the 'upload' key; never touches 'download' so download progress (e.g. page bar) stays visible.
     Returns (staging_id, None) on success or (None, error_message) on failure.
     """
     db = get_db()
@@ -140,6 +141,7 @@ def upload_to_staging(file_path: str, filename: str, doc: dict) -> tuple[ObjectI
     try:
         bucket = GridFSBucket(db, bucket_name=GRIDFS_BUCKET)
         size = os.path.getsize(file_path)
+        # Only set upload state; do not pass download= so existing download (e.g. current_page/total_pages) is preserved
         set_state(upload={"bytes_sent": 0, "bytes_total": size, "percent": 0})
 
         def on_progress(sent: int, total: int) -> None:
