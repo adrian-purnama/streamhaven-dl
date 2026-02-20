@@ -1,0 +1,484 @@
+"""
+Sniffer: bot-resistant GET agent and helpers for fetching embed/stream pages.
+Uses browser-like headers and a persistent session to reduce bot detection.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import requests
+from urllib.parse import urlparse
+import re
+
+from bs4 import BeautifulSoup
+
+from process_state import set_state
+
+# -----------------------------------------------------------------------------
+# Browser-like headers (Chrome on Windows) — resist basic bot checks
+# -----------------------------------------------------------------------------
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Use "gzip, deflate" only — "br" (Brotli) is not decoded by requests by default, so you get binary in r.text
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+    "Cache-Control": "max-age=0",
+    "DNT": "1",
+    "Priority": "u=0, i",
+}
+
+
+def _origin_for_url(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def create_agent(**kwargs) -> requests.Session:
+    """
+    Create a requests.Session that sends browser-like headers by default.
+    Use this for multiple requests to the same site (cookies + connection reuse).
+    """
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    for k, v in kwargs.items():
+        if v is not None:
+            session.headers[k] = v
+    return session
+
+
+def get(
+    url: str,
+    *,
+    referer: str | None = None,
+    session: requests.Session | None = None,
+    timeout: float = 30,
+    **kwargs,
+) -> requests.Response:
+    """
+    GET `url` with bot-resistant headers. Uses a one-off request or your session.
+
+    - referer: if None, set to the origin of `url` so the request looks same-origin.
+    - session: if given, use it (and its cookies); otherwise use a one-off request with default headers.
+    - timeout, **kwargs: passed through to requests.get().
+    """
+    headers = kwargs.pop("headers", None) or {}
+    if referer is None:
+        referer = _origin_for_url(url) + "/"
+    if referer:
+        headers["Referer"] = referer
+
+    if session is not None:
+        return session.get(url, headers=headers, timeout=timeout, **kwargs)
+
+    h = {**DEFAULT_HEADERS, **headers}
+    return requests.get(url, headers=h, timeout=timeout, **kwargs)
+
+
+def parse_html(html: str, parser: str = "html.parser") -> BeautifulSoup:
+    """Parse HTML string into a BeautifulSoup tree. Query with .find(), .find_all(), .select()."""
+    return BeautifulSoup(html, parser)
+
+
+# -----------------------------------------------------------------------------
+# Cloudnestra: build prorcp link + referer (same as play.html iframe)
+# -----------------------------------------------------------------------------
+
+CLOUDNESTRA_BASE = "https://cloudnestra.com"
+
+
+def build_prorcp_url(token: str, base: str = CLOUDNESTRA_BASE) -> str:
+    """Build full URL for iframe src: base + /prorcp/ + token (from play.html loadIframe)."""
+    token = (token or "").strip().lstrip("/")
+    if token.startswith("prorcp/"):
+        token = token[7:]
+    return f"{base.rstrip('/')}/prorcp/{token}"
+
+
+def build_rcp_referer(token: str, base: str = CLOUDNESTRA_BASE) -> str:
+    """Build Referer for prorcp request: the parent /rcp/ page (same as address bar when you click play)."""
+    token = (token or "").strip().lstrip("/")
+    if token.startswith("rcp/"):
+        token = token[4:]
+    return f"{base.rstrip('/')}/rcp/{token}"
+
+
+def get_prorcp(
+    prorcp_token: str,
+    rcp_token: str,
+    *,
+    base: str = CLOUDNESTRA_BASE,
+    session: requests.Session | None = None,
+    timeout: float = 30,
+    **kwargs,
+) -> requests.Response:
+    """
+    GET the player iframe content (prorcp). Uses correct Referer so server returns 200.
+
+    - prorcp_token: the token from iframe src in play.html (path after /prorcp/).
+    - rcp_token: the token of the parent /rcp/ page (the page with the play button).
+    """
+    prorcp_url = build_prorcp_url(prorcp_token, base)
+    referer = build_rcp_referer(rcp_token, base)
+    return get(prorcp_url, referer=referer, session=session, timeout=timeout, **kwargs)
+
+
+# Example: from play.html you have iframe src="/prorcp/TOKEN1" and parent page is /rcp/TOKEN2
+#   link = build_prorcp_url("TOKEN1")           # https://cloudnestra.com/prorcp/TOKEN1
+#   referer = build_rcp_referer("TOKEN2")       # https://cloudnestra.com/rcp/TOKEN2
+#   r = get_prorcp("TOKEN1", "TOKEN2")          # GET link with Referer: referer
+
+
+# -----------------------------------------------------------------------------
+# Example usage
+# -----------------------------------------------------------------------------
+
+# URL = "https://vidsrcme.ru/embed/movie?tmdb=129"
+URL = "https://vidsrcme.ru/embed/movie?tmdb=326359"
+
+# All downloads go here (same as main.py DOWNLOAD_DIR when set). Created if missing.
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+DOWNLOADS_DIR = os.path.abspath(os.path.join(_script_dir, "downloads"))
+
+# Preferred quality when master m3u8 has multiple variants: "low" | "med" | "high"
+PREFERRED_QUALITY = os.environ.get("M3U8_QUALITY", "high").strip().lower()
+if PREFERRED_QUALITY not in ("low", "med", "high"):
+    PREFERRED_QUALITY = "low"
+
+# Direct path to ffmpeg binary, or leave empty to use PATH. Example: r"C:\ffmpeg\bin\ffmpeg.exe"
+FFMPEG_PATH = r"C:\Users\adria\Downloads\ffmpeg-master-latest-win64-gpl-shared\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
+
+
+def _parse_master_m3u8(text: str) -> list[dict]:
+    """Parse master m3u8; return list of {bandwidth, resolution, height, path, tier}."""
+    lines = text.strip().splitlines()
+    variants = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            bandwidth = 0
+            resolution = ""
+            # BANDWIDTH=123456
+            mb = re.search(r"BANDWIDTH=(\d+)", line, re.I)
+            if mb:
+                bandwidth = int(mb.group(1))
+            # RESOLUTION=1920x1024
+            mr = re.search(r"RESOLUTION=(\d+x\d+)", line, re.I)
+            if mr:
+                resolution = mr.group(1)
+            w, h = 0, 0
+            if resolution:
+                parts = resolution.split("x")
+                if len(parts) == 2:
+                    try:
+                        w, h = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        pass
+            i += 1
+            path = (lines[i].strip() if i < len(lines) else "").lstrip("/")
+            if path and not path.startswith("#"):
+                # Classify by height: low <= 480, med <= 720, high > 720
+                if h <= 480:
+                    tier = "low"
+                elif h <= 720:
+                    tier = "med"
+                else:
+                    tier = "high"
+                variants.append({"bandwidth": bandwidth, "resolution": resolution, "height": h, "path": "/" + path, "tier": tier})
+            i += 1
+        else:
+            i += 1
+    return variants
+
+
+def _pick_variant(variants: list[dict], preferred: str) -> dict | None:
+    """Pick one variant by preferred tier (low/med/high). If multiple in tier, pick best in that tier."""
+    if not variants:
+        return None
+    if len(variants) == 1:
+        return variants[0]
+    in_tier = [v for v in variants if v["tier"] == preferred]
+    if not in_tier:
+        # Fallback: high -> highest, low -> lowest, med -> middle by height
+        if preferred == "high":
+            return max(variants, key=lambda v: (v["height"], v["bandwidth"]))
+        if preferred == "low":
+            return min(variants, key=lambda v: (v["height"], -v["bandwidth"]))
+        # med: pick middle by height
+        by_height = sorted(variants, key=lambda v: v["height"])
+        return by_height[len(by_height) // 2]
+    if preferred == "high":
+        return max(in_tier, key=lambda v: (v["height"], v["bandwidth"]))
+    if preferred == "low":
+        return min(in_tier, key=lambda v: (v["height"], -v["bandwidth"]))
+    # med
+    return max(in_tier, key=lambda v: v["bandwidth"])
+
+
+def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int | None = None, log: bool = False) -> bool:
+    """Run ffmpeg to download m3u8 to output_path. Returns True on success."""
+    ffmpeg = None
+    if FFMPEG_PATH:
+        if os.path.isfile(FFMPEG_PATH):
+            ffmpeg = FFMPEG_PATH
+        elif os.path.isdir(FFMPEG_PATH):
+            ffmpeg = os.path.join(FFMPEG_PATH, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+            if not os.path.isfile(ffmpeg):
+                ffmpeg = None
+    if not ffmpeg:
+        ffmpeg = "ffmpeg"
+        if sys.platform == "win32":
+            for name in ("ffmpeg.exe", "ffmpeg"):
+                if shutil.which(name):
+                    ffmpeg = name
+                    break
+        else:
+            if shutil.which("ffmpeg"):
+                ffmpeg = "ffmpeg"
+    cmd = [
+        ffmpeg, "-y", "-i", m3u8_url,
+        "-c", "copy", "-bsf:a", "aac_adtstoasc",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout_sec)
+        stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+        if result.returncode != 0:
+            print("      ffmpeg failed:", result.returncode, (stderr[-500:] if stderr else ""))
+            return False
+        # Optionally print/log ffmpeg output
+        if stderr and log:
+            for line in stderr.strip().splitlines():
+                print("      [ffmpeg]", line)
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print("      ffmpeg failed:", e)
+        return False
+
+
+def run_sniffer(
+    url: str,
+    *,
+    download: bool = True,
+    preferred_quality: str | None = None,
+    log: bool = True,
+) -> dict:
+    """
+    Run the full sniffer pipeline for a vidsrc embed URL. Returns a result dict.
+    Does not sys.exit; use result["success"] and result["status"] / result["error"].
+    """
+    quality = (preferred_quality or PREFERRED_QUALITY).strip().lower()
+    if quality not in ("low", "med", "high"):
+        quality = "high"
+    result = {"success": False, "status": "idle", "m3u8_link": None, "output_path": None, "error": None}
+
+    set_state(phase="searching")
+
+    def _finish(res: dict) -> dict:
+        set_state(phase="idle", snifferResult=res)
+        return res
+
+    def _log(msg: str) -> None:
+        if log:
+            print(msg)
+
+    _log("[1/8] Fetching vidsrc embed page...")
+    try:
+        vidsrc = get(url)
+    except Exception as e:
+        result["status"] = "vidsrc_down"
+        result["error"] = str(e)
+        _log("      FAIL: vidsrc is down (connection/timeout/error).")
+        _log("      " + str(e))
+        return _finish(result)
+
+    if vidsrc.status_code != 200:
+        result["status"] = "vidsrc_down"
+        result["error"] = "status %s" % vidsrc.status_code
+        _log("      FAIL: vidsrc is down or returned error (status %s)." % vidsrc.status_code)
+        return _finish(result)
+
+    _log("      OK %s | length: %s" % (vidsrc.status_code, len(vidsrc.text)))
+    soup = parse_html(vidsrc.text)
+    _log("[2/8] Finding Cloudnestra /rcp/ iframe...")
+    iframe = soup.find("iframe", id="player_iframe")
+    if not (iframe and iframe.get("src")):
+        result["status"] = "video_not_available"
+        result["error"] = "no player_iframe"
+        _log("      FAIL: vidsrc is up but video is not available (no player_iframe).")
+        return _finish(result)
+    src = iframe["src"].strip()
+    if src.startswith("//"):
+        src = "https:" + src
+    _log("      Cloudnestra /rcp URL: " + (src[:70] + "..." if len(src) > 70 else src))
+
+    _log("[3/8] Extracting rcp token and fetching /rcp/ page (play.html)...")
+    parsed = urlparse(src)
+    if "/rcp/" not in parsed.path:
+        result["status"] = "error"
+        result["error"] = "no /rcp/ segment"
+        _log("      Unexpected path, no /rcp/ segment.")
+        return _finish(result)
+    rcp_token = parsed.path.split("/rcp/", 1)[1]
+    _log("      rcp_token: " + (rcp_token[:40] + "..." if len(rcp_token) > 40 else rcp_token))
+    try:
+        rcp_resp = get(src)
+        rcp_resp.raise_for_status()
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        return _finish(result)
+    _log("      OK %s" % rcp_resp.status_code)
+
+    _log("[4/8] Finding /prorcp/ token in JS (loadIframe)...")
+    m = re.search(r"src:\s*'/prorcp/([^']+)'", rcp_resp.text)
+    if not m:
+        result["status"] = "error"
+        result["error"] = "no prorcp token"
+        _log("      No /prorcp/ token found in rcp page.")
+        return _finish(result)
+    prorcp_token = m.group(1)
+    _log("      prorcp_token: " + (prorcp_token[:40] + "..." if len(prorcp_token) > 40 else prorcp_token))
+
+    _log("[5/8] GET prorcp player page (with Referer)...")
+    try:
+        prorcp_resp = get_prorcp(prorcp_token, rcp_token)
+        prorcp_resp.raise_for_status()
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        return _finish(result)
+    _log("      OK %s | length: %s" % (prorcp_resp.status_code, len(prorcp_resp.text)))
+
+    _log("[6/8] Extracting m3u8 path and test_doms from prorcp HTML...")
+    m3u8_path = None
+    m_path = re.search(r'https?://[^/]+(/pl/[^\s"\'<>]+\.m3u8)', prorcp_resp.text, re.I)
+    if m_path:
+        m3u8_path = m_path.group(1)
+    if not m3u8_path:
+        m_path = re.search(r'(/pl/[^\s"\'<>]+\.m3u8)', prorcp_resp.text, re.I)
+        if m_path:
+            m3u8_path = m_path.group(1)
+    if not m3u8_path:
+        _log("      No m3u8 path found.")
+    else:
+        _log("      m3u8_path: " + (m3u8_path[:80] + "..." if len(m3u8_path) > 80 else m3u8_path))
+    dom_candidates = []
+    m_arr = re.search(r'test_doms\s*=\s*\[([^\]]*)\]', prorcp_resp.text, re.DOTALL)
+    if m_arr:
+        inner = m_arr.group(1)
+        dom_candidates = [u.strip('"').strip() for u in re.findall(r'"https?://[^"]+"', inner)]
+    if not dom_candidates:
+        dom_candidates = [u.strip('"') for u in re.findall(r'"https?://[^"]+\.(?:com|net|org)[^"]*"', prorcp_resp.text)]
+    _log("      test_doms: %s | %s" % (len(dom_candidates), dom_candidates[:4]))
+
+    if not dom_candidates:
+        result["status"] = "no_domains"
+        result["error"] = "no test_doms found"
+        _log("      No test_doms found.")
+        return _finish(result)
+    if not m3u8_path:
+        result["status"] = "no_m3u8_path"
+        result["error"] = "no m3u8 path in prorcp"
+        _log("      Have domains but no m3u8 path; stopping.")
+        return _finish(result)
+
+    _log("[7/8] Testing domains for availability (200)...")
+    ready_domain = None
+    for dom in dom_candidates:
+        try:
+            r = get(dom.rstrip("/"), timeout=10)
+            if r.status_code == 200:
+                ready_domain = dom.rstrip("/")
+                _log("      Ready: " + ready_domain)
+                break
+            _log("      %s -> %s" % (dom, r.status_code))
+        except Exception as e:
+            _log("      Skip %s | %s" % (dom, e))
+    if not ready_domain:
+        result["status"] = "no_ready_domain"
+        result["error"] = "no domain returned 200"
+        _log("      No domain returned 200.")
+        return _finish(result)
+
+    _log("[8/8] Fetching master m3u8, parsing variants (low/med/high), picking %s ..." % quality)
+    master_url = ready_domain + (m3u8_path if m3u8_path.startswith("/") else "/" + m3u8_path)
+    _log("      master_url: " + (master_url[:80] + "..." if len(master_url) > 80 else master_url))
+    try:
+        master_resp = get(master_url, timeout=15)
+        master_resp.raise_for_status()
+        variants = _parse_master_m3u8(master_resp.text)
+        _log("      Master OK | variants: %s" % len(variants))
+    except Exception as e:
+        _log("      Failed to fetch master m3u8: %s" % e)
+        variants = []
+    if not variants:
+        _log("      No variants -> using master URL as final link.")
+        m3u8_link = master_url
+    else:
+        for v in variants:
+            _log("        %s %s %s -> %s" % (v.get("tier"), v.get("resolution"), v.get("bandwidth"), (v.get("path") or "")[:60] + "..."))
+        chosen = _pick_variant(variants, quality)
+        if chosen:
+            final_path = chosen["path"]
+            final_url = ready_domain + (final_path if final_path.startswith("/") else "/" + final_path)
+            _log("      Picked: %s | %s | BANDWIDTH= %s" % (chosen.get("tier"), chosen.get("resolution"), chosen.get("bandwidth")))
+            m3u8_link = final_url
+        else:
+            m3u8_link = master_url
+    result["m3u8_link"] = m3u8_link
+
+    if not download:
+        result["success"] = True
+        result["status"] = "ok"
+        return _finish(result)
+
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+    output_mp4 = os.environ.get("M3U8_OUTPUT") or os.path.join(DOWNLOADS_DIR, "sniffer_download.mp4")
+    _log("[9/9] Downloading with ffmpeg -> " + output_mp4)
+    set_state(phase="downloading", download={"byte_done": 0, "byte_total": None})
+    if not download_m3u8_with_ffmpeg(m3u8_link, output_mp4, timeout_sec=3600):
+        result["status"] = "ffmpeg_failed"
+        result["error"] = "ffmpeg download failed"
+        _log("      ffmpeg download failed.")
+        return _finish(result)
+    _log("      Done. " + output_mp4)
+    result["success"] = True
+    result["status"] = "ok"
+    result["output_path"] = output_mp4
+    return _finish(result)
+
+
+def main():
+    """CLI: run sniffer for default URL and exit with 0/1."""
+    res = run_sniffer(URL)
+    if res["success"]:
+        print("m3u8 link:", res.get("m3u8_link"))
+        if res.get("output_path"):
+            print("output_path:", res["output_path"])
+    else:
+        print("FAIL:", res.get("status"), res.get("error"))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

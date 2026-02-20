@@ -4,3 +4,5 @@ beautifulsoup4>=4.12.0
 torrentp>=0.2.0
 python-dotenv>=1.0.0
 the-python-bay
+playwright>=1.40.0
+pymongo>=4.6.0
