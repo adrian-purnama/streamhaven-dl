@@ -7,6 +7,8 @@ import os
 import sys
 import time
 from threading import Lock, Thread
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 # Load .env
 try:
@@ -78,6 +80,12 @@ DOWNLOAD_QUEUE_COLLECTION = os.environ.get("DOWNLOAD_QUEUE_COLLECTION", "downloa
 # GridFS bucket and StagingVideo collection (same as backend)
 GRIDFS_BUCKET = "stagingVideos"
 STAGING_VIDEO_COLLECTION = "stagingvideos"
+# Subtitle staging (same as backend stagingSubtitle.model.js + subtitleGridFs.model.js)
+SUBTITLE_GRIDFS_BUCKET = "stagingSubtitles"
+STAGING_SUBTITLE_COLLECTION = "stagingsubtitles"
+UPLOADED_VIDEO_COLLECTION = "uploadedvideos"
+BACKEND_URL = (os.environ.get("BACKEND_URL") or "").strip().rstrip("/")
+WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET") or "").strip()
 
 # -----------------------------------------------------------------------------
 # Flask app
@@ -163,6 +171,55 @@ def upload_to_staging(file_path: str, filename: str, doc: dict) -> tuple[ObjectI
             "status": "pending",
         }
         r = staging_coll.insert_one(staging_doc)
+        return (r.inserted_id, None)
+    except Exception as e:
+        return (None, str(e))
+
+
+def _content_type_for_subtitle(filename: str) -> str:
+    """Return MIME type for subtitle extension."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".srt":
+        return "application/x-subrip"
+    if ext == ".vtt":
+        return "text/vtt"
+    if ext in (".ass", ".ssa"):
+        return "text/x-ssa"
+    return "application/x-subrip"
+
+
+def upload_subtitle_to_staging(
+    file_path: str, filename: str, tmdb_id: int, language: str
+) -> tuple[ObjectId | None, str | None]:
+    """
+    Upload subtitle file to GridFS (stagingSubtitles bucket) and create StagingSubtitle doc.
+    Returns (staging_subtitle_id, None) on success or (None, error_message) on failure.
+    """
+    db = get_db()
+    if db is None:
+        return (None, "Database not connected")
+    if not os.path.isfile(file_path):
+        return (None, "File not found")
+    try:
+        bucket = GridFSBucket(db, bucket_name=SUBTITLE_GRIDFS_BUCKET)
+        size = os.path.getsize(file_path)
+        content_type = _content_type_for_subtitle(filename)
+        with open(file_path, "rb") as f:
+            file_id = bucket.upload_from_stream(
+                filename, f, metadata={"contentType": content_type}
+            )
+        coll = db[STAGING_SUBTITLE_COLLECTION]
+        staging_doc = {
+            "gridFsFileId": file_id,
+            "filename": filename,
+            "size": size,
+            "contentType": content_type,
+            "language": language,
+            "tmdbId": tmdb_id,
+            "stagingVideoId": None,
+            "status": "pending",
+        }
+        r = coll.insert_one(staging_doc)
         return (r.inserted_id, None)
     except Exception as e:
         return (None, str(e))
@@ -319,6 +376,173 @@ def download():
         _loop_running = True
     Thread(target=_worker_loop, daemon=True).start()
     return jsonify({"success": True, "message": "Loop started"})
+
+
+def _subtitle_already_exists(tmdb_id: int, language: str) -> bool:
+    """Return True if this language is already on the uploaded video or in staging subtitles."""
+    db = get_db()
+    if db is None:
+        return False
+    lang = (language or "").strip()
+    if not lang:
+        return False
+    # 1) Uploaded video: subtitle.downloadedSubtitles is [String] of language codes
+    uv = db[UPLOADED_VIDEO_COLLECTION].find_one({"externalId": tmdb_id})
+    if uv:
+        sub_obj = uv.get("subtitle") or {}
+        if isinstance(sub_obj, dict):
+            downloaded = sub_obj.get("downloadedSubtitles") or []
+            if lang in downloaded:
+                return True
+        elif isinstance(sub_obj, list) and lang in sub_obj:
+            return True
+    # 2) Staging subtitle: already have a doc for this tmdbId + language
+    existing = db[STAGING_SUBTITLE_COLLECTION].find_one({"tmdbId": tmdb_id, "language": lang})
+    if existing:
+        return True
+    return False
+
+
+def _call_process_subtitle_webhook(tmdb_id: int, language: str) -> None:
+    """Fire-and-forget: notify backend that subtitle was uploaded to staging (add to uploaded video)."""
+    if not BACKEND_URL:
+        return
+    url = f"{BACKEND_URL}/api/languages/process-subtitle?externalId={tmdb_id}&language={language}"
+    headers = {}
+    if WEBHOOK_SECRET:
+        headers["X-Webhook-Secret"] = WEBHOOK_SECRET
+
+    def _do():
+        try:
+            req = Request(url, headers=headers, method="GET")
+            urlopen(req, timeout=10)
+        except (URLError, HTTPError, OSError) as e:
+            print(f"[download-subtitle] webhook call failed: {e}", flush=True)
+
+    t = Thread(target=_do, daemon=True)
+    t.start()
+
+
+@app.route("/available-subtitles", methods=["GET"])
+def available_subtitles():
+    """
+    GET /available-subtitles?title=Movie+Name+2024
+    Search indexsubtitle.cc, return available languages for the best-matching title.
+    Response: { success, data: { languages: [{short, long, count}], totalSubtitles } }
+    """
+    from subtitle import (
+        SEARCH_URL, HEADERS as SUB_HEADERS, BASE_URL as SUB_BASE,
+        _pick_best, _extract_datatable_json, get_available_languages,
+    )
+    import requests as sub_requests
+
+    title = (request.args.get("title") or "").strip()
+    if not title:
+        return jsonify({"success": False, "message": "title query param required"}), 400
+
+    try:
+        resp = sub_requests.post(SEARCH_URL, data={"query": title}, headers=SUB_HEADERS, timeout=15)
+        resp.raise_for_status()
+        results = resp.json()
+        match = _pick_best(results, title)
+        if not match:
+            return jsonify({"success": True, "data": {"languages": [], "totalSubtitles": 0}})
+        detail_url = SUB_BASE + match["url"]
+        detail = sub_requests.get(detail_url, headers=SUB_HEADERS, timeout=15)
+        detail.raise_for_status()
+        subs = _extract_datatable_json(detail.text)
+        langs = get_available_languages(subs)
+        return jsonify({
+            "success": True,
+            "data": {"languages": langs, "totalSubtitles": len(subs)},
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/download-subtitle", methods=["POST"])
+def download_subtitle_route():
+    """
+    POST /download-subtitle  Body: { externalId, language (ISO 639-1 e.g. "en"), title }
+    Searches indexsubtitle.cc, picks a subtitle for the language, downloads it,
+    uploads to GridFS staging, and calls the backend webhook.
+    """
+    from subtitle import (
+        SEARCH_URL, HEADERS as SUB_HEADERS, BASE_URL as SUB_BASE,
+        _pick_best, _extract_datatable_json, short_to_long,
+        download_subtitle as sub_download,
+    )
+    import requests as sub_requests
+
+    if _get_mongo_status() != "connected":
+        return jsonify({"success": False, "message": "MongoDB not connected"}), 503
+    data = request.get_json() or {}
+    external_id = data.get("externalId")
+    language = (data.get("language") or "").strip()
+    title = (data.get("title") or "").strip()
+    if external_id is None or not language:
+        return jsonify({"success": False, "message": "externalId and language are required"}), 400
+    if not title:
+        return jsonify({"success": False, "message": "title is required"}), 400
+    try:
+        tmdb_id = int(external_id)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "externalId must be a number"}), 400
+
+    if _subtitle_already_exists(tmdb_id, language):
+        _call_process_subtitle_webhook(tmdb_id, language)
+        return jsonify({"success": True, "message": "Subtitle already exists"}), 200
+
+    _subtitle_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitle_downloads")
+    os.makedirs(_subtitle_dir, exist_ok=True)
+
+    try:
+        # 1) Search
+        resp = sub_requests.post(SEARCH_URL, data={"query": title}, headers=SUB_HEADERS, timeout=15)
+        resp.raise_for_status()
+        results = resp.json()
+        match = _pick_best(results, title)
+        if not match:
+            return jsonify({"success": False, "message": "Subtitle not found"}), 404
+
+        # 2) Detail page -> get all subtitles
+        detail_url = SUB_BASE + match["url"]
+        detail = sub_requests.get(detail_url, headers=SUB_HEADERS, timeout=15)
+        detail.raise_for_status()
+        subs = _extract_datatable_json(detail.text)
+        lang_long = short_to_long(language)
+        filtered = [s for s in subs if (s.get("language") or "").strip().lower() == lang_long]
+        if not filtered:
+            return jsonify({"success": False, "message": f"No subtitle for language '{language}'"}), 404
+
+        # 3) Download the first matching subtitle
+        pick = filtered[0]
+        filepath = sub_download(pick, _subtitle_dir)
+        if not filepath or not os.path.isfile(filepath):
+            return jsonify({"success": False, "message": "Download failed"}), 500
+
+        # 4) Upload to GridFS staging
+        filename = os.path.basename(filepath)
+        sid, err = upload_subtitle_to_staging(filepath, filename, tmdb_id, language)
+        if sid is None:
+            return jsonify({"success": False, "message": err or "Upload to staging failed"}), 500
+
+        # 5) Cleanup
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+
+        # 6) Notify backend webhook
+        _call_process_subtitle_webhook(tmdb_id, language)
+        return jsonify({
+            "success": True,
+            "message": "Subtitle downloaded and staged",
+            "stagingSubtitleIds": [str(sid)],
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
 
 @app.route("/health", methods=["GET"])
 def health():
