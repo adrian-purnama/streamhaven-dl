@@ -452,6 +452,7 @@ def available_subtitles():
         detail.raise_for_status()
         subs = _extract_datatable_json(detail.text)
         langs = get_available_languages(subs)
+        print(langs)
         return jsonify({
             "success": True,
             "data": {"languages": langs, "totalSubtitles": len(subs)},
@@ -517,6 +518,7 @@ def download_subtitle_route():
 
         # 3) Download the first matching subtitle
         pick = filtered[0]
+        print(pick)
         filepath = sub_download(pick, _subtitle_dir)
         if not filepath or not os.path.isfile(filepath):
             return jsonify({"success": False, "message": "Download failed"}), 500

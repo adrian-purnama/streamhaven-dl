@@ -89,7 +89,8 @@ for _long, _short in LANG_TO_SHORT.items():
 
 def get_available_languages(subs: list[dict]) -> list[dict]:
     """
-    From the subtitle list, return unique languages with short (ISO 639-1) and long forms.
+    From the subtitle list, return unique languages by short (ISO 639-1) with long form and total count.
+    Merges variants that share the same short code (e.g. big_5_code + chinese_bg_code -> one zh entry).
     Returns: [{ "short": "en", "long": "english", "count": 52 }, ...]
     """
     counts: dict[str, int] = {}
@@ -97,10 +98,18 @@ def get_available_languages(subs: list[dict]) -> list[dict]:
         lang = (s.get("language") or "").strip().lower()
         if lang:
             counts[lang] = counts.get(lang, 0) + 1
-    result = []
+    # Merge by short code so e.g. zh appears once (big_5_code + chinese_bg_code)
+    merged: dict[str, tuple[int, str]] = {}  # short -> (total_count, long_name for display)
     for long_name, count in sorted(counts.items(), key=lambda x: -x[1]):
         short = LANG_TO_SHORT.get(long_name, long_name[:2])
-        result.append({"short": short, "long": long_name, "count": count})
+        if short in merged:
+            merged[short] = (merged[short][0] + count, merged[short][1])
+        else:
+            merged[short] = (count, long_name)
+    result = [
+        {"short": short, "long": long_name, "count": total}
+        for short, (total, long_name) in sorted(merged.items(), key=lambda x: -x[1][0])
+    ]
     return result
 
 
