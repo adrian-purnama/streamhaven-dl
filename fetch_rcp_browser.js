@@ -1,3 +1,4 @@
+git add .
 #!/usr/bin/env node
 /**
  * Fetch an rcp (play.html) URL in a real browser via Puppeteer.

@@ -11,6 +11,8 @@ SEARCH_URL = f"{BASE_URL}/search"
 SUBTITLES_INFO_URL = f"{BASE_URL}/subtitlesInfo"
 SUBTITLE_DOWNLOADS_DIR = "subtitle_downloads"
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
+# Only these are accepted; if archive has only .sub/.ass/.ssa we delete and try next
+PREFERRED_EXTENSIONS = (".srt", ".vtt")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0",
@@ -130,7 +132,7 @@ def _subtitles_page_url(sub_entry: dict) -> str:
 
 
 def _dump_response(resp: requests.Response, label: str) -> None:
-    """Optional debug: log full response when JSON parse fails. No-op by default."""
+    """Optional: log full response when JSON parse fails (no-op by default)."""
     pass
 
 
@@ -160,11 +162,12 @@ def _get_download_token(sub_entry: dict, session: requests.Session, referer: str
 
 
 def _build_download_url(sub_entry: dict, token: str) -> str:
-    """Build the /d/{id}/{ttl}/{token}/{zipname}.zip URL. TTL is current time so link is valid."""
-    url_path = sub_entry.get("url", "")
-    sub_id = url_path.rstrip("/").split("/")[-1]
-    zp = re.sub(r"[^\w ]", "", url_path).replace("/", "_")
-    zp = f"[indexsubtitle.cc]_{zp}"
+    """Build /d/{id}/{ttl}/{token}/{zipname}.zip exactly like the site's JavaScript."""
+    url_path = (sub_entry.get("url") or "").strip().rstrip("/")
+    parts = url_path.split("/")
+    sub_id = parts[-1] if parts else ""
+    # Match site: zp = url.replace(/[^\w ]/,'').replace(/\\//g,'_').replace('subtitle_','[indexsubtitle.cc]_')
+    zp = re.sub(r"[^\w ]", "", url_path).replace("/", "_").replace("subtitle_", "[indexsubtitle.cc]_")
     ttl = int(time.time())
     return f"{BASE_URL}/d/{sub_id}/{ttl}/{token}/{zp}.zip"
 
@@ -191,42 +194,94 @@ def download_subtitle(
     if not token:
         return None
     dl_url = _build_download_url(sub_entry, token)
-    resp = session.get(dl_url, timeout=30)
+    # Use same session + cookies and proper Referer header for the actual file download
+    resp = session.get(dl_url, headers={**HEADERS, "Referer": referer_url}, timeout=30)
     resp.raise_for_status()
 
-    # Download result is a zip; save then extract subtitle files from it
-    zip_path = os.path.join(dest_dir, "subtitle_download.zip")
-    with open(zip_path, "wb") as f:
-        f.write(resp.content)
+    # Save raw response using original filename if possible
+    content = resp.content
+    cd = resp.headers.get("content-disposition", "") or resp.headers.get("Content-Disposition", "")
+    filename = None
+    if cd:
+        m = re.search(r'filename="?([^";]+)"?', cd)
+        if m:
+            filename = m.group(1).strip()
+    if not filename:
+        filename = dl_url.rstrip("/").split("/")[-1] or "subtitle_download.zip"
 
-    if not zipfile.is_zipfile(zip_path):
-        # Not a zip (e.g. error page or raw srt)
-        ext = ".srt"
-        for e in SUBTITLE_EXTENSIONS:
-            if resp.headers.get("content-type", "").lower().find(e.lstrip(".")) >= 0:
-                ext = e
-                break
-        raw_path = os.path.join(dest_dir, f"subtitle{ext}")
-        os.rename(zip_path, raw_path)
-        return raw_path
+    # Server often returns RAR (magic "Rar!") instead of ZIP; save with correct extension
+    is_rar = content[:4] == b"Rar!" if len(content) >= 4 else False
+    if is_rar:
+        base = os.path.splitext(filename)[0]
+        filename = base + ".rar"
+    save_path = os.path.join(dest_dir, filename)
+    with open(save_path, "wb") as f:
+        f.write(content)
 
-    # Extract subtitle files from zip before using
+    def _preferred_path(extracted_list):
+        """Return path to first .srt or .vtt, or None if none."""
+        for p in extracted_list:
+            if p.lower().endswith(".srt"):
+                return p
+        for p in extracted_list:
+            if p.lower().endswith(".vtt"):
+                return p
+        return None
+
+    def _cleanup(archive_path, extracted_paths):
+        """Delete archive and extracted files (e.g. when only .sub/.ass/.ssa)."""
+        for p in extracted_paths:
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                pass
+        try:
+            if os.path.isfile(archive_path):
+                os.remove(archive_path)
+        except OSError:
+            pass
+
+    if is_rar:
+        # Extract subtitle files from RAR
+        try:
+            import rarfile
+            extracted = []
+            with rarfile.RarFile(save_path, "r") as rf:
+                for name in rf.namelist():
+                    lower = name.lower()
+                    if any(lower.endswith(e) for e in SUBTITLE_EXTENSIONS):
+                        rf.extract(name, dest_dir)
+                        extracted.append(os.path.join(dest_dir, name))
+            if not extracted:
+                return None
+            preferred = _preferred_path(extracted)
+            if preferred is None:
+                _cleanup(save_path, extracted)
+                return None
+            return preferred
+        except Exception:
+            return None
+
+    if not zipfile.is_zipfile(save_path):
+        return None
+
+    # Extract subtitle files from zip
     extracted = []
-    with zipfile.ZipFile(zip_path, "r") as zf:
+    with zipfile.ZipFile(save_path, "r") as zf:
         for name in zf.namelist():
             lower = name.lower()
             if any(lower.endswith(e) for e in SUBTITLE_EXTENSIONS):
                 zf.extract(name, dest_dir)
                 extracted.append(os.path.join(dest_dir, name))
-    os.remove(zip_path)
 
     if not extracted:
         return None
-    # Prefer .srt
-    for p in extracted:
-        if p.lower().endswith(".srt"):
-            return p
-    return extracted[0]
+    preferred = _preferred_path(extracted)
+    if preferred is None:
+        _cleanup(save_path, extracted)
+        return None
+    return preferred
 
 
 if __name__ == "__main__":
@@ -244,24 +299,17 @@ if __name__ == "__main__":
     match = _pick_best(results, query)
     if not match:
         exit(1)
-
     # 2) Detail page (use session so cookies are reused for token + download)
     detail_url = BASE_URL + match["url"]
     session = requests.Session()
     session.headers.update(HEADERS)
     detail = session.get(detail_url, timeout=15)
     subs = _extract_datatable_json(detail.text)
-
-    # 3) Available languages
     langs = get_available_languages(subs)
-
-    # 4) Filter by language and pick first
     filtered = [s for s in subs if s.get("language", "").lower() == lang]
     if not filtered:
         exit(1)
     pick = filtered[0]
-
-    # 5) Get token (same session + Referer) and download
     path = download_subtitle(pick, session=session, referer=detail_url)
     if not path:
         exit(1)

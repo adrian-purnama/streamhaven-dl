@@ -5,3 +5,4 @@ torrentp>=0.2.0
 python-dotenv>=1.0.0
 the-python-bay
 pymongo>=4.6.0
+rarfile>=4.2

@@ -416,8 +416,8 @@ def _call_process_subtitle_webhook(tmdb_id: int, language: str) -> None:
         try:
             req = Request(url, headers=headers, method="GET")
             urlopen(req, timeout=10)
-        except (URLError, HTTPError, OSError):
-            pass
+        except (URLError, HTTPError, OSError) as e:
+            print(f"[download-subtitle] webhook call failed: {e}", flush=True)
 
     t = Thread(target=_do, daemon=True)
     t.start()
@@ -521,11 +521,14 @@ def download_subtitle_route():
         if not filtered:
             return jsonify({"success": False, "message": f"No subtitle for language '{language}'"}), 404
 
-        # 3) Download (sub_download uses session + Referer for /subtitlesInfo like Postman)
-        pick = filtered[0]
-        filepath = sub_download(pick, _subtitle_dir)
+        # 3) Download: try each subtitle until we get .srt or .vtt (skip .sub/.ass/.ssa-only)
+        filepath = None
+        for pick in filtered:
+            filepath = sub_download(pick, _subtitle_dir)
+            if filepath and os.path.isfile(filepath):
+                break
         if not filepath or not os.path.isfile(filepath):
-            return jsonify({"success": False, "message": "Download failed"}), 500
+            return jsonify({"success": False, "message": "Download failed (no .srt/.vtt found for this language)"}), 500
 
         # 4) Upload to GridFS staging
         filename = os.path.basename(filepath)
@@ -539,7 +542,7 @@ def download_subtitle_route():
         except OSError:
             pass
 
-        # 6) Notify backend webhook (process-subtitle)
+        # 6) Notify backend webhook
         _call_process_subtitle_webhook(tmdb_id, language)
         return jsonify({
             "success": True,
