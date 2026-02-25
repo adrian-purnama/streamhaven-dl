@@ -416,8 +416,8 @@ def _call_process_subtitle_webhook(tmdb_id: int, language: str) -> None:
         try:
             req = Request(url, headers=headers, method="GET")
             urlopen(req, timeout=10)
-        except (URLError, HTTPError, OSError) as e:
-            print(f"[download-subtitle] webhook call failed: {e}", flush=True)
+        except (URLError, HTTPError, OSError):
+            pass
 
     t = Thread(target=_do, daemon=True)
     t.start()
@@ -443,7 +443,10 @@ def available_subtitles():
     try:
         resp = sub_requests.post(SEARCH_URL, data={"query": title}, headers=SUB_HEADERS, timeout=15)
         resp.raise_for_status()
-        results = resp.json()
+        try:
+            results = resp.json()
+        except ValueError as e:
+            return jsonify({"success": False, "message": f"Search returned non-JSON: {e}"}), 500
         match = _pick_best(results, title)
         if not match:
             return jsonify({"success": True, "data": {"languages": [], "totalSubtitles": 0}})
@@ -452,7 +455,6 @@ def available_subtitles():
         detail.raise_for_status()
         subs = _extract_datatable_json(detail.text)
         langs = get_available_languages(subs)
-        print(langs)
         return jsonify({
             "success": True,
             "data": {"languages": langs, "totalSubtitles": len(subs)},
@@ -498,10 +500,13 @@ def download_subtitle_route():
     os.makedirs(_subtitle_dir, exist_ok=True)
 
     try:
-        # 1) Search
+        # 1) Search (same headers as Postman: Referer, Origin, X-Requested-With – no cookies)
         resp = sub_requests.post(SEARCH_URL, data={"query": title}, headers=SUB_HEADERS, timeout=15)
         resp.raise_for_status()
-        results = resp.json()
+        try:
+            results = resp.json()
+        except ValueError as e:
+            return jsonify({"success": False, "message": f"Search returned non-JSON: {e}"}), 500
         match = _pick_best(results, title)
         if not match:
             return jsonify({"success": False, "message": "Subtitle not found"}), 404
@@ -516,9 +521,8 @@ def download_subtitle_route():
         if not filtered:
             return jsonify({"success": False, "message": f"No subtitle for language '{language}'"}), 404
 
-        # 3) Download the first matching subtitle
+        # 3) Download (sub_download uses session + Referer for /subtitlesInfo like Postman)
         pick = filtered[0]
-        print(pick)
         filepath = sub_download(pick, _subtitle_dir)
         if not filepath or not os.path.isfile(filepath):
             return jsonify({"success": False, "message": "Download failed"}), 500
@@ -535,7 +539,7 @@ def download_subtitle_route():
         except OSError:
             pass
 
-        # 6) Notify backend webhook
+        # 6) Notify backend webhook (process-subtitle)
         _call_process_subtitle_webhook(tmdb_id, language)
         return jsonify({
             "success": True,

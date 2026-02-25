@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import difflib
 import zipfile
 import requests
@@ -8,15 +9,16 @@ import requests
 BASE_URL = "https://indexsubtitle.cc"
 SEARCH_URL = f"{BASE_URL}/search"
 SUBTITLES_INFO_URL = f"{BASE_URL}/subtitlesInfo"
-DOWNLOAD_TTL = 1771853823
 SUBTITLE_DOWNLOADS_DIR = "subtitle_downloads"
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
     "X-Requested-With": "XMLHttpRequest",
-    "Referer": BASE_URL,
-    "Authorization": BASE_URL,
+    "Referer": f"{BASE_URL}/",
+    "Origin": BASE_URL,
 }
 
 
@@ -118,52 +120,87 @@ def short_to_long(code: str) -> str:
     return SHORT_TO_LANG.get(code.strip().lower(), code.strip().lower())
 
 
-def _get_download_token(sub_entry: dict) -> str | None:
-    """POST /subtitlesInfo to get the download token for a subtitle entry."""
+def _subtitles_page_url(sub_entry: dict) -> str:
+    """Build the subtitles page URL (e.g. for Referer and for fetching cookies)."""
+    url_path = (sub_entry.get("url") or "").strip().rstrip("/")
+    if not url_path:
+        return f"{BASE_URL}/subtitles"
+    slug = url_path.split("/")[0]
+    return f"{BASE_URL}/subtitles/{slug}"
+
+
+def _dump_response(resp: requests.Response, label: str) -> None:
+    """Optional debug: log full response when JSON parse fails. No-op by default."""
+    pass
+
+
+def _get_download_token(sub_entry: dict, session: requests.Session, referer: str) -> str | None:
+    """POST /subtitlesInfo to get the download token; uses session cookies and Referer like browser."""
     url_path = sub_entry.get("url", "")
     sub_id = url_path.rstrip("/").split("/")[-1]
     lang = sub_entry.get("language", "")
-    resp = requests.post(
+    headers = {**HEADERS, "Referer": referer, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
+    resp = session.post(
         SUBTITLES_INFO_URL,
         data={"id": sub_id, "lang": lang, "url": url_path},
-        headers=HEADERS,
+        headers=headers,
         timeout=15,
     )
     resp.raise_for_status()
-    data = resp.json()
-    return data.get("token")
+    text = (resp.text or "").strip()
+    if not text or not (text.startswith("{") or text.startswith("[")):
+        _dump_response(resp, "/subtitlesInfo non-JSON")
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        _dump_response(resp, "/subtitlesInfo JSON error")
+        return None
+    return data.get("token") if isinstance(data, dict) else None
 
 
 def _build_download_url(sub_entry: dict, token: str) -> str:
-    """Build the /d/{id}/{ttl}/{token}/{zipname}.zip URL."""
+    """Build the /d/{id}/{ttl}/{token}/{zipname}.zip URL. TTL is current time so link is valid."""
     url_path = sub_entry.get("url", "")
     sub_id = url_path.rstrip("/").split("/")[-1]
     zp = re.sub(r"[^\w ]", "", url_path).replace("/", "_")
     zp = f"[indexsubtitle.cc]_{zp}"
-    return f"{BASE_URL}/d/{sub_id}/{DOWNLOAD_TTL}/{token}/{zp}.zip"
+    ttl = int(time.time())
+    return f"{BASE_URL}/d/{sub_id}/{ttl}/{token}/{zp}.zip"
 
 
-def download_subtitle(sub_entry: dict, dest_dir: str = SUBTITLE_DOWNLOADS_DIR) -> str | None:
+def download_subtitle(
+    sub_entry: dict,
+    dest_dir: str = SUBTITLE_DOWNLOADS_DIR,
+    *,
+    session: requests.Session | None = None,
+    referer: str | None = None,
+) -> str | None:
     """
-    Fetch token, download the zip, extract subtitle files.
+    Fetch token (with session + cookies like browser), download the zip, extract subtitle files.
+    If session/referer are provided (e.g. caller already opened the subtitles page), they are reused.
     Returns path to the extracted .srt (or first subtitle file), or None on failure.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    token = _get_download_token(sub_entry)
+    referer_url = referer or _subtitles_page_url(sub_entry)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        session.get(referer_url, timeout=15)
+    token = _get_download_token(sub_entry, session, referer_url)
     if not token:
-        print("[subtitle2] Failed to get download token")
         return None
-
     dl_url = _build_download_url(sub_entry, token)
-    resp = requests.get(dl_url, headers=HEADERS, timeout=30)
+    resp = session.get(dl_url, timeout=30)
     resp.raise_for_status()
 
+    # Download result is a zip; save then extract subtitle files from it
     zip_path = os.path.join(dest_dir, "subtitle_download.zip")
     with open(zip_path, "wb") as f:
         f.write(resp.content)
 
     if not zipfile.is_zipfile(zip_path):
-        # Might be a raw srt
+        # Not a zip (e.g. error page or raw srt)
         ext = ".srt"
         for e in SUBTITLE_EXTENSIONS:
             if resp.headers.get("content-type", "").lower().find(e.lstrip(".")) >= 0:
@@ -173,7 +210,7 @@ def download_subtitle(sub_entry: dict, dest_dir: str = SUBTITLE_DOWNLOADS_DIR) -
         os.rename(zip_path, raw_path)
         return raw_path
 
-    # Extract subtitle files from zip
+    # Extract subtitle files from zip before using
     extracted = []
     with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
@@ -195,49 +232,36 @@ def download_subtitle(sub_entry: dict, dest_dir: str = SUBTITLE_DOWNLOADS_DIR) -
 if __name__ == "__main__":
     query = "Spirited Away 2001"
     lang = "english"
-    print(f"Searching: {query}")
 
     # 1) Search
     resp = requests.post(SEARCH_URL, data={"query": query}, headers=HEADERS, timeout=15)
-    results = resp.json()
+    resp.raise_for_status()
+    try:
+        results = resp.json()
+    except json.JSONDecodeError:
+        _dump_response(resp, "Search response")
+        exit(1)
     match = _pick_best(results, query)
     if not match:
-        print("No match found")
-        exit()
-    print(f"Best match: {match['title']} -> {match['url']}")
+        exit(1)
 
-    # 2) Detail page
+    # 2) Detail page (use session so cookies are reused for token + download)
     detail_url = BASE_URL + match["url"]
-    detail = requests.get(detail_url, headers=HEADERS, timeout=15)
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    detail = session.get(detail_url, timeout=15)
     subs = _extract_datatable_json(detail.text)
-    print(f"Total subtitles: {len(subs)}")
 
     # 3) Available languages
     langs = get_available_languages(subs)
-    print(f"\nAvailable languages ({len(langs)}):")
-    for l in langs:
-        print(f"  {l['short']:4s}  {l['long']:30s}  ({l['count']})")
 
     # 4) Filter by language and pick first
     filtered = [s for s in subs if s.get("language", "").lower() == lang]
-    print(f"\n{lang.title()} subtitles: {len(filtered)}")
     if not filtered:
-        print("No subtitles for this language")
-        exit()
+        exit(1)
     pick = filtered[0]
-    print(f"Picking: {pick['title']}  |  {pick['author']['name']}  |  {pick['url']}")
 
-    # 5) Get token and download
-    print("\nFetching token...")
-    token = _get_download_token(pick)
-    print(f"Token: {token}")
-    if not token:
-        print("Failed to get token")
-        exit()
-
-    print("Downloading...")
-    path = download_subtitle(pick)
-    if path:
-        print(f"Downloaded to: {path}")
-    else:
-        print("Download failed")
+    # 5) Get token (same session + Referer) and download
+    path = download_subtitle(pick, session=session, referer=detail_url)
+    if not path:
+        exit(1)
