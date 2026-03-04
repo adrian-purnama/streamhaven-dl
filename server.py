@@ -75,8 +75,9 @@ _run_lock = Lock()
 _loop_lock = Lock()
 _loop_running = False
 
-# Mongoose default collection for DownloadQueue is "downloadqueues"
+# Mongoose default collections for DownloadQueue and DownloadSeriesQueue
 DOWNLOAD_QUEUE_COLLECTION = os.environ.get("DOWNLOAD_QUEUE_COLLECTION", "downloadqueues")
+DOWNLOAD_SERIES_QUEUE_COLLECTION = os.environ.get("DOWNLOAD_SERIES_QUEUE_COLLECTION", "downloadseriesqueues")
 # GridFS bucket and StagingVideo collection (same as backend)
 GRIDFS_BUCKET = "stagingVideos"
 STAGING_VIDEO_COLLECTION = "stagingvideos"
@@ -170,6 +171,12 @@ def upload_to_staging(file_path: str, filename: str, doc: dict) -> tuple[ObjectI
             "title": doc.get("title") or "",
             "status": "pending",
         }
+        if doc.get("mediaType") == "tv":
+            staging_doc["mediaType"] = "tv"
+            if doc.get("seasonNumber") is not None:
+                staging_doc["seasonNumber"] = doc["seasonNumber"]
+            if doc.get("episodeNumber") is not None:
+                staging_doc["episodeNumber"] = doc["episodeNumber"]
         r = staging_coll.insert_one(staging_doc)
         return (r.inserted_id, None)
     except Exception as e:
@@ -225,10 +232,29 @@ def upload_subtitle_to_staging(
         return (None, str(e))
 
 
-def _watch_url_from_tmdb(tmdb_id) -> str:
-    """Build vidsrc-style embed URL from TMDB id. Override with env SNIFFER_BASE_URL."""
-    base = os.environ.get("SNIFFER_BASE_URL", "https://vidsrc.xyz/embed/movie/").rstrip("/")
-    return f"{base}/{tmdb_id}"
+def _watch_url_for_job(tmdb_id: int, media_type: str | None = None, season: int | None = None, episode: int | None = None) -> str:
+    """
+    Build vidsrc-style embed URL from TMDB id and, for TV episodes, season/episode.
+
+    Defaults:
+    - Movies: https://vidsrcme.ru/embed/movie/3332
+    - Series: https://vidsrcme.ru/embed/tv?tmdb=1&season=1&episode=1
+
+    Override with:
+    - SNIFFER_MOVIE_BASE_URL (e.g. https://vidsrcme.ru/embed/movie)
+    - SNIFFER_TV_BASE_URL    (e.g. https://vidsrcme.ru/embed/tv)
+    """
+    if tmdb_id is None:
+        return ""
+    media = (media_type or "").lower()
+    if media == "tv":
+        base_tv = os.environ.get("SNIFFER_TV_BASE_URL", "https://vidsrcme.ru/embed/tv").rstrip("/")
+        if season is None or episode is None:
+            return ""
+        return f"{base_tv}?tmdb={tmdb_id}&season={season}&episode={episode}"
+    # default: movie
+    base_movie = os.environ.get("SNIFFER_MOVIE_BASE_URL", "https://vidsrcme.ru/embed/movie").rstrip("/")
+    return f"{base_movie}/{tmdb_id}"
 
 
 def _get_queue_coll():
@@ -239,36 +265,108 @@ def _get_queue_coll():
     return db[DOWNLOAD_QUEUE_COLLECTION]
 
 
+def _get_series_queue_coll():
+    """DownloadSeriesQueue collection (per-episode TV jobs)."""
+    db = get_db()
+    if db is None:
+        return None
+    return db[DOWNLOAD_SERIES_QUEUE_COLLECTION]
+
+
 def get_next_waiting():
-    """Atomically claim the next waiting job (oldest by createdAt). Returns doc or None."""
+    """
+    Atomically claim the next waiting job (oldest by createdAt).
+    Looks at:
+      - DownloadQueue (movies, mediaType='movie')
+      - DownloadSeriesQueue (per-episode TV jobs)
+    Returns a doc with a private field "__coll" indicating which collection it came from.
+    """
     print("[sniffer_server] getting next waiting job")
-    coll = _get_queue_coll()
-    if coll is None:
+    db = get_db()
+    if db is None:
         return None
-    doc = coll.find_one({"status": "waiting"}, sort=[("createdAt", 1)])
-    if not doc:
+
+    movie_coll = _get_queue_coll()
+    series_coll = _get_series_queue_coll()
+    if movie_coll is None and series_coll is None:
         return None
-    r = coll.update_one(
-        {"_id": doc["_id"], "status": "waiting"},
+
+    movie_doc = None
+    series_doc = None
+
+    if movie_coll is not None:
+        movie_doc = movie_coll.find_one(
+            {"status": "waiting", "mediaType": "movie"},
+            sort=[("createdAt", 1)],
+        )
+    if series_coll is not None:
+        series_doc = series_coll.find_one(
+            {"status": "waiting"},
+            sort=[("createdAt", 1)],
+        )
+
+    chosen_doc = None
+    chosen_coll = None
+    if movie_doc and series_doc:
+        # Choose the oldest by createdAt
+        if movie_doc.get("createdAt") <= series_doc.get("createdAt"):
+            chosen_doc, chosen_coll = movie_doc, movie_coll
+        else:
+            chosen_doc, chosen_coll = series_doc, series_coll
+    elif movie_doc:
+        chosen_doc, chosen_coll = movie_doc, movie_coll
+    elif series_doc:
+        chosen_doc, chosen_coll = series_doc, series_coll
+    else:
+        return None
+
+    r = chosen_coll.update_one(
+        {"_id": chosen_doc["_id"], "status": "waiting"},
         {"$set": {"status": "searching"}},
     )
     if r.modified_count == 0:
         return None
-    return doc
+
+    # Mark which collection this doc came from so _process_one_job can update the right place
+    chosen_doc["__coll"] = chosen_coll.name
+    return chosen_doc
 
 
 def _process_one_job(doc) -> dict:
     """Run sniffer for one queue doc (already claimed as searching). Step 1: get m3u8 link. Step 2: run ffmpeg."""
-    coll = _get_queue_coll()
+    db = get_db()
+    coll = None
+    if db is not None:
+        coll_name = doc.get("__coll") or DOWNLOAD_QUEUE_COLLECTION
+        coll = db[coll_name]
     doc_id = doc["_id"]
+    # For TV episodes, tmdbId and mediaType live on the parent DownloadQueue doc.
     tmdb_id = doc.get("tmdbId")
+    media_type = (doc.get("mediaType") or "").lower()
+    season = doc.get("seasonNumber")
+    episode = doc.get("episodeNumber")
+
+    parent = None
+    # Heuristic: series episodes live in DownloadSeriesQueue and have parentId + seasonNumber + episodeNumber.
+    if (tmdb_id is None or media_type != "movie") and db is not None and "parentId" in doc:
+        parent_id = doc.get("parentId")
+        try:
+            # parentId is an ObjectId in MongoDB; trust it as-is.
+            parent_coll = db[DOWNLOAD_QUEUE_COLLECTION]
+            parent = parent_coll.find_one({"_id": parent_id})
+        except Exception:
+            parent = None
+        if parent:
+            tmdb_id = tmdb_id or parent.get("tmdbId")
+            media_type = (parent.get("mediaType") or "tv").lower()
+
     quality = (doc.get("quality") or "high").strip().lower()
     if quality == "medium":
         quality = "med"
 
     url = doc.get("url")
     if not url and tmdb_id is not None:
-        url = _watch_url_from_tmdb(tmdb_id)
+        url = _watch_url_for_job(tmdb_id, media_type=media_type, season=season, episode=episode)
     if not url:
         set_state(phase="idle")
         if coll is not None:
@@ -298,14 +396,17 @@ def _process_one_job(doc) -> dict:
     set_state(phase="downloading", explanation="[9/9] Downloading with ffmpeg -> " + output_mp4)
     if coll is not None:
         coll.update_one({"_id": doc_id}, {"$set": {"status": "downloading", "errorMessage": None}})
-    ok = download_m3u8_with_ffmpeg(m3u8_link, output_mp4, timeout_sec=3600, log=True)
+    ok, ffmpeg_err = download_m3u8_with_ffmpeg(m3u8_link, output_mp4, timeout_sec=3600, log=True)
     if not ok:
         result["success"] = False
         result["status"] = "ffmpeg_failed"
-        result["error"] = "ffmpeg download failed"
+        result["error"] = ffmpeg_err or "ffmpeg download failed"
         if coll is not None:
-            coll.update_one({"_id": doc_id}, {"$set": {"status": "failed", "errorMessage": "ffmpeg failed"}})
-        set_state(phase="failed", snifferResult=result, explanation="ffmpeg failed")
+            coll.update_one(
+                {"_id": doc_id},
+                {"$set": {"status": "failed", "errorMessage": result["error"]}},
+            )
+        set_state(phase="failed", snifferResult=result, explanation=result["error"])
         try:
             if os.path.isfile(output_mp4):
                 os.remove(output_mp4)
@@ -313,13 +414,23 @@ def _process_one_job(doc) -> dict:
         except OSError as e:
             print("[sniffer_server] failed to delete partial download:", e)
         set_state(phase="idle", snifferResult=result)
-        return {"success": False, "message": "ffmpeg failed", "url": url}
+        return {"success": False, "message": result["error"], "url": url}
 
     result["output_path"] = output_mp4
     if coll is not None:
         coll.update_one({"_id": doc_id}, {"$set": {"status": "uploading", "errorMessage": None}})
+    # Build staging meta: for TV, tmdbId/poster_path come from parent; include mediaType/season/episode for series.
+    staging_meta = {
+        "tmdbId": tmdb_id,
+        "title": doc.get("title") or "download",
+        "poster_path": parent.get("poster_path") if parent else doc.get("poster_path"),
+    }
+    if media_type == "tv":
+        staging_meta["mediaType"] = "tv"
+        staging_meta["seasonNumber"] = season
+        staging_meta["episodeNumber"] = episode
     set_state(phase="uploading", explanation="[10/10] Uploading to staging")
-    staging_id, upload_err = upload_to_staging(output_mp4, safe_name, doc)
+    staging_id, upload_err = upload_to_staging(output_mp4, safe_name, staging_meta)
     if staging_id is not None:
         result["success"] = True
         result["status"] = "ok"

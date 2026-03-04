@@ -230,7 +230,7 @@ def _fetch_rcp_page_with_browser(rcp_url: str, log_fn=None) -> tuple[str | None,
 # -----------------------------------------------------------------------------
 
 # URL = "https://vidsrcme.ru/embed/movie?tmdb=129"
-URL = "https://vidsrcme.ru/embed/movie?tmdb=326359"
+URL = "https://vidsrcme.ru/embed/movie/326359"
 
 # All downloads go here (same as main.py DOWNLOAD_DIR when set). Created if missing.
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -339,8 +339,11 @@ def _get_total_pages_from_m3u8(m3u8_url: str) -> int | None:
         return None
 
 
-def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int | None = None, log: bool = False) -> bool:
-    """Run ffmpeg to download m3u8 to output_path. Returns True on success."""
+def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int | None = None, log: bool = False) -> tuple[bool, str | None]:
+    """
+    Run ffmpeg to download m3u8 to output_path.
+    Returns (ok: bool, error: str | None) where error is a short ffmpeg stderr summary on failure.
+    """
     ffmpeg = None
     if FFMPEG_PATH:
         if os.path.isfile(FFMPEG_PATH):
@@ -369,7 +372,13 @@ def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int 
         if total_pages is not None:
             set_state(download={"total_pages": total_pages, "current_page": 0})
 
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, universal_newlines=True, errors="replace")
+        proc = subprocess.Popen(
+            cmd,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            universal_newlines=True,
+            errors="replace",
+        )
         stderr_lines = []
         opening_re = re.compile(r"Opening\s+'([^']+)'\s+for\s+reading", re.I)
 
@@ -400,18 +409,24 @@ def download_m3u8_with_ffmpeg(m3u8_url: str, output_path: str, timeout_sec: int 
             if timeout_sec is not None and (time.time() - start) > timeout_sec:
                 proc.kill()
                 proc.wait()
-                print("      ffmpeg timeout", flush=True)
-                return False
+                msg = "ffmpeg timeout"
+                print("      " + msg, flush=True)
+                return (False, msg)
             time.sleep(0.2)
         reader.join(timeout=2.0)
         if proc.returncode != 0:
             tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
-            print("      ffmpeg failed:", proc.returncode, tail[-500:] if tail else "", flush=True)
-            return False
-        return True
+            snippet = tail[-500:] if tail else ""
+            msg = f"ffmpeg failed with code {proc.returncode}"
+            if snippet:
+                msg += f": {snippet}"
+            print("      " + msg, flush=True)
+            return (False, msg)
+        return (True, None)
     except FileNotFoundError as e:
-        print("      ffmpeg failed:", e, flush=True)
-        return False
+        msg = f"ffmpeg not found: {e}"
+        print("      " + msg, flush=True)
+        return (False, msg)
 
 
 def run_sniffer(
