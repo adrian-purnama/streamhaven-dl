@@ -101,22 +101,25 @@ def parse_html(html: str, parser: str = "html.parser") -> BeautifulSoup:
 
 
 # -----------------------------------------------------------------------------
-# Cloudnestra: build prorcp link + referer (same as play.html iframe)
+# Cloudnestra: build prorcp/srcrcp link + referer (same as play.html iframe)
 # -----------------------------------------------------------------------------
 
 CLOUDNESTRA_BASE = "https://cloudnestra.com"
 
 
 def build_prorcp_url(token: str, base: str = CLOUDNESTRA_BASE) -> str:
-    """Build full URL for iframe src: base + /prorcp/ + token (from play.html loadIframe)."""
+    """Build full URL for iframe src: base + /prorcp/ + token (from play.html loadIframe).
+
+    The HTML may use either /prorcp/ or /srcrcp/; we normalize the token so we can reuse it.
+    """
     token = (token or "").strip().lstrip("/")
-    if token.startswith("prorcp/"):
-        token = token[7:]
+    if token.startswith("prorcp/") or token.startswith("srcrcp/"):
+        token = token.split("/", 1)[1]
     return f"{base.rstrip('/')}/prorcp/{token}"
 
 
 def build_rcp_referer(token: str, base: str = CLOUDNESTRA_BASE) -> str:
-    """Build Referer for prorcp request: the parent /rcp/ page (same as address bar when you click play)."""
+    """Build Referer for prorcp/srcrcp request: the parent /rcp/ page (same as address bar when you click play)."""
     token = (token or "").strip().lstrip("/")
     if token.startswith("rcp/"):
         token = token[4:]
@@ -133,9 +136,9 @@ def get_prorcp(
     **kwargs,
 ) -> requests.Response:
     """
-    GET the player iframe content (prorcp). Uses correct Referer so server returns 200.
+    GET the player iframe content (prorcp/srcrcp). Uses correct Referer so server returns 200.
 
-    - prorcp_token: the token from iframe src in play.html (path after /prorcp/).
+    - prorcp_token: the token from iframe src in play.html (path after /prorcp/ or /srcrcp/).
     - rcp_token: the token of the parent /rcp/ page (the page with the play button).
     """
     prorcp_url = build_prorcp_url(prorcp_token, base)
@@ -143,12 +146,12 @@ def get_prorcp(
     return get(prorcp_url, referer=referer, session=session, timeout=timeout, **kwargs)
 
 
-# Patterns to extract prorcp token from rcp page HTML (shared by normal GET and browser fallback)
+# Patterns to extract prorcp/srcrcp token from rcp page HTML (shared by normal GET and browser fallback)
 _PRORCP_PATTERNS = (
-    r"src:\s*['\"]\/prorcp\/([^'\"]+)['\"]",
-    r"src\s*:\s*['\"]\/prorcp\/([^'\"]+)['\"]",
-    r"['\"]\/prorcp\/([^'\"]+)['\"]",
-    r"\/prorcp\/([^\s'\"<>]{20,})",
+    r"src:\s*['\"]\/(?:prorcp|srcrcp)\/([^'\"]+)['\"]",
+    r"src\s*:\s*['\"]\/(?:prorcp|srcrcp)\/([^'\"]+)['\"]",
+    r"['\"]\/(?:prorcp|srcrcp)\/([^'\"]+)['\"]",
+    r"\/(?:prorcp|srcrcp)\/([^\s'\"<>]{20,})",
 )
 
 
@@ -511,11 +514,11 @@ def run_sniffer(
         rcp_html, rcp_cookies = _fetch_rcp_page_with_browser(src, log_fn=_log)
         prorcp_token = _extract_prorcp_token(rcp_html) if rcp_html else None
 
-    set_state(explanation="[4/8] Finding /prorcp/ token in JS (loadIframe)")
+    set_state(explanation="[4/8] Finding /prorcp/ or /srcrcp/ token in JS (loadIframe)")
     if not prorcp_token:
         result["status"] = "error"
-        result["error"] = "no prorcp token (Turnstile or missing in page)"
-        _log("      No /prorcp/ token found in rcp page.")
+        result["error"] = "no prorcp/srcrcp token (Turnstile or missing in page)"
+        _log("      No /prorcp/ or /srcrcp/ token found in rcp page.")
         return _finish(result)
     _log("      prorcp_token: " + (prorcp_token[:40] + "..." if len(prorcp_token) > 40 else prorcp_token))
 

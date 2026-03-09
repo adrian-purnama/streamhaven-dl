@@ -29,18 +29,19 @@ async function main() {
     );
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Poll until page content contains /prorcp/ (Turnstile solved, real content loaded)
+    // Poll until page content contains /prorcp/ or /srcrcp/ (Turnstile solved, real content loaded)
     const maxWaitMs = 60000;
     const pollMs = 1000;
+    const tokenRegex = /\/(?:prorcp|srcrcp)\//;
     let html = '';
     for (let elapsed = 0; elapsed < maxWaitMs; elapsed += pollMs) {
       html = await page.content();
-      if (/\/prorcp\//.test(html)) break;
+      if (tokenRegex.test(html)) break;
       await new Promise((r) => setTimeout(r, pollMs));
     }
 
-    if (!/\/prorcp\//.test(html)) {
-      console.log(JSON.stringify({ error: 'prorcp token never appeared (Turnstile timeout?)' }));
+    if (!tokenRegex.test(html)) {
+      console.log(JSON.stringify({ error: 'prorcp/srcrcp token never appeared (Turnstile timeout?)' }));
       process.exit(1);
     }
 
